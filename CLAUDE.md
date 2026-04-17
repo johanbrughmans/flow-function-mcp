@@ -1,0 +1,131 @@
+# CLAUDE.md — flow-function-mcp
+
+> **Inherits from:** `~/.claude/CLAUDE.md` (Global BIOS)
+> **Project:** flow-function-mcp — Function Layer MCP Server
+
+---
+
+## Project Identity
+
+| Attribute | Value |
+|-----------|-------|
+| Repo | `johanbrughmans/flow-function-mcp` |
+| Layer | Function (TGF 5-layer: layer 3) |
+| Role | Stateless signal computation — indicators, SMC, order flow, on-chain analysis |
+| Language | Rust (edition 2021) |
+| Architecture | Hexagonal + DDD + parse-don't-validate |
+| Deploy target | OMV ARM64 (`192.168.0.126`) — systemd `flow-function-mcp.service` |
+| Port | `3467` |
+| MCP endpoint | `http://192.168.0.126:3467/mcp` |
+
+---
+
+## Architecture
+
+```
+domain/           ← zero I/O; pure computation functions
+  indicators/     ← RSI, MA, ATR, Bollinger, Donchian, HV
+  smc/            ← FVG, OrderBlocks, Structure, Liquidity
+  ha.rs           ← HA computation + pattern detection
+  flow.rs         ← OrderFlow ratios (MB/MS/LB/LS)
+  onchain/        ← GovernanceSignal, OrderbookPressure, StakingFlow, WalletFlow
+  types.rs        ← Direction, StructureType, Zone, Level, Period
+  candle.rs       ← OhlcvCandle (with optional trade-flow fields)
+  pair.rs         ← Pair newtype
+  timeframe.rs    ← Timeframe enum
+  window.rs       ← Window
+ports/
+  market_data.rs  ← MarketDataPort (fetch OHLCV from PCTS)
+  onchain.rs      ← OnChainPort (fetch from OMV SQLite)
+adapters/
+  pcts/           ← PCTS SQL Server via tiberius (OHLCV)
+  sqlite/         ← OMV SQLite via rusqlite (orderbook, cosmos, transfers, wallets, governance)
+  composite.rs    ← routing
+  mcp/            ← FlowFunctionServer (16 tools)
+main.rs           ← bootstrap: reads env, builds adapters, starts HTTP MCP
+```
+
+---
+
+## Data Sources
+
+| Source | Type | Data |
+|--------|------|------|
+| PCTS (`192.168.0.137:1433`) | SQL Server via tiberius | OHLCV + trade-flow (MB/MS/LB/LS) |
+| OMV SQLite (`/opt/enj-flow/data/token-flow.db`) | rusqlite read-only | orderbook, cosmos_stake_events, transfer_events, wallet_classifications, governance |
+
+---
+
+## MCP Tools (all QUERY, read-only)
+
+### OHLCV Indicators
+| Tool | Args | Returns |
+|------|------|---------|
+| `rsi` | `pair, tf, last_n, period?` | `[{ts, rsi}]` |
+| `ma_cross` | `pair, tf, last_n, fast?, slow?, ma_type?` | `[{ts, fast_ma, slow_ma, cross?}]` |
+| `atr` | `pair, tf, last_n, period?` | `[{ts, atr}]` |
+| `bollinger` | `pair, tf, last_n, period?, n_std?` | `[{ts, middle, upper, lower, width, pct_b}]` |
+| `donchian` | `pair, tf, last_n, period?` | `[{ts, upper, mid, lower, width}]` |
+| `volatility` | `pair, tf, last_n, period?` | `[{ts, hv}]` (annualised %) |
+
+### Smart Money Concepts
+| Tool | Args | Returns |
+|------|------|---------|
+| `fvg` | `pair, tf, last_n` | `[{ts, direction, top, bottom, filled}]` |
+| `order_blocks` | `pair, tf, last_n` | `[{ts, direction, top, bottom, broken}]` |
+| `structure` | `pair, tf, last_n` | `[{ts, event_type, level, direction}]` |
+| `liquidity` | `pair, tf, last_n` | `[{ts, price, side, swept}]` |
+
+### Price Action + Flow
+| Tool | Args | Returns |
+|------|------|---------|
+| `ha_pattern` | `pair, tf, last_n` | `[{ts, color, has_lower_wick, has_upper_wick, consecutive_count, reversal, lower_wick_signal}]` |
+| `order_flow` | `pair, tf, last_n` | `[{ts, mb_ms_ratio?, lb_ls_ratio?, net_aggression?, market_pct?, avg_mb_size?, avg_ms_size?}]` |
+
+### Non-OHLCV (different data sources — see ADR-005)
+| Tool | Args | Source | Returns |
+|------|------|--------|---------|
+| `governance_signal` | `pair?` | `asset_governance_state` + `asset_ath` | `[{pair, state, ha_color, depression_pct, entry_levels, ready_for_entry, signal_strength}]` |
+| `orderbook_pressure` | `pair, last_n?` | `kraken_orderbook` | `[{ts, bid_ask_ratio_10/25/50, dominant_side, spread_bps}]` |
+| `staking_flow` | `last_n?, period_type?` | `cosmos_stake_events` | `[{period, delegated_atom, undelegated_atom, net_atom, flow_direction, event_count}]` |
+| `wallet_flow` | `token, last_n?` | `transfer_events` + `wallet_classifications` | `[{period, exchange_inflow, exchange_outflow, net_flow, flow_direction, transfer_count}]` |
+
+---
+
+## Governance
+
+- CQRS: all 16 tools are QUERY — no write operations
+- GitHub Issues only (Epic #1, Stories #2-#7)
+- Mutations require explicit mandaat per global CLAUDE.md
+
+---
+
+## Dev Conventions
+
+- **Parse-don't-validate**: `Pair::parse()`, `Timeframe::from_str()`, `Direction::from_str()` at every MCP boundary
+- **Strong typing**: `Direction` enum, `StructureType` enum, `Period(NonZeroU32)` newtype
+- **SoC**: `domain/` has zero imports from `adapters/` or `ports/`
+- **Seed lookback**: fetch `last_n + seed` candles, compute, trim to `last_n` — all indicators aligned
+- **`spawn_blocking`** for all rusqlite calls
+- **Division-by-zero**: all ratio fields are `Option<f64>`, return `None` not panic
+
+---
+
+## Env vars (`.env` on OMV at `/opt/flow-function-mcp/.env`)
+
+```
+FLOW_FUNCTION_PORT=3467
+FLOW_DATA_DB=/opt/enj-flow/data/token-flow.db
+PCTS_HOST=192.168.0.137
+PCTS_USER=sql-admin-2
+PCTS_PASS=DeWindWaaitHard01$
+```
+
+---
+
+## Deploy
+
+CI: GitHub Actions self-hosted runner `flow-function-mcp-arm64` on OMV.
+Push to `main` → pull → `cargo build --release` → `systemctl restart flow-function-mcp`.
+
+Health check: `curl http://192.168.0.126:3467/health`

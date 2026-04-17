@@ -1,0 +1,35 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, arm64]
+    timeout-minutes: 20
+
+    steps:
+      - name: Pull latest
+        run: |
+          cd ~/flow-function-mcp-src
+          git pull
+
+      - name: Build
+        run: |
+          cd ~/flow-function-mcp-src
+          . ~/.cargo/env
+          cargo build --release
+
+      - name: Deploy
+        run: |
+          echo 'BXNeL948BqcKfFF' | sudo -S bash -c '
+            systemctl stop flow-function-mcp 2>/dev/null || true
+            sleep 1
+            cp /home/Remote_ATOM_Node/flow-function-mcp-src/target/release/flow-function-mcp /opt/flow-function-mcp/bin/flow-function-mcp
+            chmod +x /opt/flow-function-mcp/bin/flow-function-mcp
+            systemctl start flow-function-mcp
+          '
+
+      - name: Verify
+        run: systemctl is-active flow-function-mcp

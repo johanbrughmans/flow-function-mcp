@@ -1,0 +1,45 @@
+[package]
+name    = "flow-function-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "flow-function-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# MCP + HTTP
+rmcp               = { version = "1.4.0", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+axum               = { version = "0.8", features = ["http2"] }
+tokio              = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+# Async trait
+async-trait        = "0.1"
+# Serialisation
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+# Error handling
+anyhow             = "1"
+# Schema
+schemars           = "1.0"
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Env
+dotenvy            = "0.15"
+# SQLite (OMV — orderbook, cosmos, transfers, wallets, governance)
+rusqlite           = { version = "0.31", features = ["bundled"] }
+# SQL Server / PCTS (OHLCV source)
+tiberius           = { version = "0.12", default-features = false, features = ["sql-browser-tokio", "chrono", "rust_decimal"] }
+tokio-util         = { version = "0.7", features = ["compat"] }
+chrono             = { version = "0.4", features = ["serde"] }
+rust_decimal       = { version = "1", features = ["maths"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all      = { level = "warn", priority = -2 }
+pedantic = { level = "warn", priority = -2 }
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+module_name_repetitions = "allow"
