@@ -1,8 +1,8 @@
 /// FlowFunctionServer — MCP inbound adapter (Function Layer, TGF Layer 3).
 ///
-/// 16 QUERY tools (read-only):
+/// 17 QUERY tools (read-only):
 ///   OHLCV indicators : rsi, ma_cross, atr, bollinger, donchian, volatility
-///   SMC              : fvg, order_blocks, structure, liquidity
+///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence
 ///   Price action+flow: ha_pattern, order_flow
 ///   Non-OHLCV        : governance_signal, orderbook_pressure, staking_flow, wallet_flow
 ///
@@ -41,6 +41,7 @@ use crate::{
         },
         pair::Pair,
         smc::{
+            fib_confluence::compute_fib_confluence,
             fvg::compute_fvg,
             liquidity::compute_liquidity,
             order_blocks::compute_order_blocks,
@@ -131,6 +132,17 @@ struct SmcInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct FibConfluenceInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
+    pair:   String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    tf:     String,
+    #[schemars(description = "Candles to scan for swing pivots (default 200, min 50)")]
+    #[serde(default = "default_fib_last_n")]
+    last_n: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct OptionalPairInput {
     #[schemars(description = "Trading pair (optional — omit for all configured pairs)")]
     #[serde(default)]
@@ -165,7 +177,8 @@ struct WalletFlowInput {
     last_n: Option<u32>,
 }
 
-fn default_last_n() -> u32 { 60 }
+fn default_last_n()     -> u32 { 60 }
+fn default_fib_last_n() -> u32 { 200 }
 
 // ── Parse helpers ──────────────────────────────────────────────────────────────
 
@@ -382,6 +395,32 @@ impl FlowFunctionServer {
         serde_json::to_string(&levels).map_err(|e| e.to_string())
     }
 
+    // ── Fibonacci Confluence ───────────────────────────────────────────────────
+
+    #[tool(
+        name = "fib_confluence",
+        description = "DiNapoli Fibonacci Confluence zones from PCTS OHLCV. \
+                       Detects swing pivots (3-bar high/low), then computes: \
+                       Retracements 38.2/50.0/61.8% from each A→B leg (DiNapoli primary set); \
+                       Expansions COP=61.8%, OP=100%, XOP=161.8% from ABC patterns (DiNapoli 1998). \
+                       Clusters all levels within 0.3% price tolerance (Boroden standard). \
+                       Returns only clusters with ≥3 distinct levels, sorted nearest-first. \
+                       atr_compressed=true when current ATR < 75% of 20-bar mean (squeeze at Fib zone). \
+                       Returns [{price, strength, direction, levels, atr_compressed, distance_pct}]. \
+                       direction: \"support\" (below close) | \"resistance\" (above close). \
+                       levels: [{label, price, anchor_ts}] — constituent Fibonacci levels. \
+                       Default last_n=200 candles (recommended for adequate swing history). \
+                       QUERY — read-only."
+    )]
+    async fn fib_confluence(&self, Parameters(req): Parameters<FibConfluenceInput>) -> Result<String, String> {
+        let pair  = parse_pair(&req.pair)?;
+        let tf    = parse_tf(&req.tf)?;
+        let n     = req.last_n.max(50);
+        let raw   = self.fetch_ohlcv(&pair, tf, n, 50).await?;
+        let zones = compute_fib_confluence(&raw);
+        serde_json::to_string(&zones).map_err(|e| e.to_string())
+    }
+
     // ── HA Pattern ─────────────────────────────────────────────────────────────
 
     #[tool(
@@ -539,7 +578,8 @@ impl ServerHandler for FlowFunctionServer {
                donchian {pair,tf,last_n,period?} | volatility {pair,tf,last_n,period?}\n\
              SMC (from PCTS SQL Server):\n\
                fvg {pair,tf,last_n} | order_blocks {pair,tf,last_n} | \
-               structure {pair,tf,last_n} | liquidity {pair,tf,last_n}\n\
+               structure {pair,tf,last_n} | liquidity {pair,tf,last_n} | \
+               fib_confluence {pair,tf,last_n?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\
                ha_pattern {pair,tf,last_n} | order_flow {pair,tf,last_n}\n\
              Non-OHLCV (from OMV SQLite):\n\
