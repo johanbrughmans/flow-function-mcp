@@ -13,7 +13,10 @@
 use crate::domain::{
     candle::OhlcvCandle,
     indicators::atr::compute_atr,
-    smc::fib_profile::FibProfile,
+    smc::{
+        fib_profile::FibProfile,
+        pivots::{detect_pivots, Pivot, PivotKind},
+    },
 };
 
 const ATR_PERIOD: usize = 14;
@@ -46,17 +49,6 @@ pub struct FibCluster {
     pub levels:         Vec<FibLevel>,
     pub atr_compressed: bool,
     pub distance_pct:   f64,
-}
-
-// ── Internal pivot (pub(crate) for future harmonics.rs) ───────────────────────
-
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum PivotKind { High, Low }
-
-pub(crate) struct Pivot {
-    pub ts:    String,
-    pub price: f64,
-    pub kind:  PivotKind,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -103,47 +95,6 @@ pub fn compute_fib_confluence(raw: &[OhlcvCandle], profile: &FibProfile) -> Vec<
     }
 
     cluster_levels(all_levels, current_close, atr_compressed, profile)
-}
-
-// ── Pivot detection (pub(crate) — shared with harmonics once implemented) ─────
-
-pub(crate) fn detect_pivots(raw: &[OhlcvCandle]) -> Vec<Pivot> {
-    let mut raw_pivots: Vec<Pivot> = Vec::new();
-    for i in 1..raw.len().saturating_sub(1) {
-        let prev = &raw[i - 1];
-        let curr = &raw[i];
-        let next = &raw[i + 1];
-        if curr.high > prev.high && curr.high >= next.high {
-            raw_pivots.push(Pivot { ts: curr.ts.clone(), price: curr.high, kind: PivotKind::High });
-        } else if curr.low < prev.low && curr.low <= next.low {
-            raw_pivots.push(Pivot { ts: curr.ts.clone(), price: curr.low, kind: PivotKind::Low });
-        }
-    }
-    deduplicate_pivots(raw_pivots)
-}
-
-pub(crate) fn deduplicate_pivots(pivots: Vec<Pivot>) -> Vec<Pivot> {
-    let mut result: Vec<Pivot> = Vec::new();
-    for p in pivots {
-        let merged = if let Some(last) = result.last_mut() {
-            if last.kind == p.kind {
-                if p.kind == PivotKind::High && p.price > last.price {
-                    last.price = p.price;
-                    last.ts    = p.ts.clone();
-                } else if p.kind == PivotKind::Low && p.price < last.price {
-                    last.price = p.price;
-                    last.ts    = p.ts.clone();
-                }
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if !merged { result.push(p); }
-    }
-    result
 }
 
 // ── Clustering ────────────────────────────────────────────────────────────────
@@ -227,30 +178,5 @@ mod tests {
     #[test]
     fn nascent_wider_tolerance_than_mature() {
         assert!(FibProfile::nascent().cluster_tolerance > FibProfile::mature().cluster_tolerance);
-    }
-
-    #[test]
-    fn deduplication_keeps_highest_high() {
-        let pivots = vec![
-            Pivot { ts: "a".into(), price: 1.0, kind: PivotKind::High },
-            Pivot { ts: "b".into(), price: 1.5, kind: PivotKind::High },
-            Pivot { ts: "c".into(), price: 0.8, kind: PivotKind::Low },
-        ];
-        let deduped = deduplicate_pivots(pivots);
-        assert_eq!(deduped.len(), 2);
-        assert!((deduped[0].price - 1.5).abs() < 1e-9);
-        assert_eq!(deduped[0].kind, PivotKind::High);
-    }
-
-    #[test]
-    fn deduplication_keeps_lowest_low() {
-        let pivots = vec![
-            Pivot { ts: "a".into(), price: 1.0, kind: PivotKind::Low },
-            Pivot { ts: "b".into(), price: 0.5, kind: PivotKind::Low },
-            Pivot { ts: "c".into(), price: 2.0, kind: PivotKind::High },
-        ];
-        let deduped = deduplicate_pivots(pivots);
-        assert_eq!(deduped.len(), 2);
-        assert!((deduped[0].price - 0.5).abs() < 1e-9);
     }
 }

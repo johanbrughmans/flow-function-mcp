@@ -1,8 +1,8 @@
 /// FlowFunctionServer — MCP inbound adapter (Function Layer, TGF Layer 3).
 ///
-/// 18 QUERY tools (read-only):
+/// 19 QUERY tools (read-only):
 ///   OHLCV indicators : rsi, ma_cross, atr, bollinger, donchian, volatility
-///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence, fib_targets
+///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence, fib_targets, harmonic_patterns
 ///   Price action+flow: ha_pattern, order_flow
 ///   Non-OHLCV        : governance_signal, orderbook_pressure, staking_flow, wallet_flow
 ///
@@ -45,6 +45,7 @@ use crate::{
             fib_profile::FibProfile,
             fib_targets::compute_fib_targets,
             fvg::compute_fvg,
+            harmonics::compute_harmonic_patterns,
             liquidity::compute_liquidity,
             order_blocks::compute_order_blocks,
             structure::compute_structure,
@@ -161,6 +162,20 @@ struct FibTargetsInput {
     #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
     #[serde(default)]
     profile:     Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct HarmonicPatternsInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
+    pair:    String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    tf:      String,
+    #[schemars(description = "Candles to scan for swing pivots (default 200, min 50)")]
+    #[serde(default = "default_fib_last_n")]
+    last_n:  u32,
+    #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -468,6 +483,32 @@ impl FlowFunctionServer {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    // ── Harmonic Patterns ──────────────────────────────────────────────────────
+
+    #[tool(
+        name = "harmonic_patterns",
+        description = "XABCD harmonic pattern detection from PCTS OHLCV (ADR-001). \
+                       Detects completed Gartley, Bat, Butterfly, Crab patterns. \
+                       Ratios per Carney/Pesavento methodology. \
+                       Bullish: X(Low) A(High) B(Low) C(High) D(Low) — buy signal at D. \
+                       Bearish: X(High) A(Low) B(High) C(Low) D(High) — sell signal at D. \
+                       D completion ratios: Gartley=0.786, Bat=0.886, Butterfly=1.272, Crab=1.618. \
+                       Returns [{ts_x, ts_a, ts_b, ts_c, ts_d, pattern, direction, d_price, xabcd_quality, exploratory}]. \
+                       xabcd_quality 0.0–1.0: closeness to ideal ratios (D×60%, AB×40%). \
+                       profile: \"nascent\" (Gartley+Bat, tol=7%) | \"developing\" (Gartley+Bat+Butterfly, tol=5%) \
+                       | \"mature\" (all 4 patterns, tol=3%, default). \
+                       Default last_n=200. QUERY — read-only."
+    )]
+    async fn harmonic_patterns(&self, Parameters(req): Parameters<HarmonicPatternsInput>) -> Result<String, String> {
+        let pair    = parse_pair(&req.pair)?;
+        let tf      = parse_tf(&req.tf)?;
+        let profile = parse_profile(req.profile)?;
+        let n       = req.last_n.max(50);
+        let raw     = self.fetch_ohlcv(&pair, tf, n, 50).await?;
+        let found   = compute_harmonic_patterns(&raw, &profile);
+        serde_json::to_string(&found).map_err(|e| e.to_string())
+    }
+
     // ── HA Pattern ─────────────────────────────────────────────────────────────
 
     #[tool(
@@ -626,7 +667,8 @@ impl ServerHandler for FlowFunctionServer {
              SMC (from PCTS SQL Server):\n\
                fvg {pair,tf,last_n} | order_blocks {pair,tf,last_n} | \
                structure {pair,tf,last_n} | liquidity {pair,tf,last_n} | \
-               fib_confluence {pair,tf,last_n?,profile?} | fib_targets {pair,tf,last_n?,entry_price,profile?}\n\
+               fib_confluence {pair,tf,last_n?,profile?} | fib_targets {pair,tf,last_n?,entry_price,profile?} | \
+               harmonic_patterns {pair,tf,last_n?,profile?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\
                ha_pattern {pair,tf,last_n} | order_flow {pair,tf,last_n}\n\
              Non-OHLCV (from OMV SQLite):\n\

@@ -26,6 +26,8 @@
 domain/           ← zero I/O; pure computation functions
   indicators/     ← RSI, MA, ATR, Bollinger, Donchian, HV
   smc/            ← FVG, OrderBlocks, Structure, Liquidity
+                    fib_confluence, fib_targets, harmonic_patterns
+                    pivots (shared pivot detection), fib_profile
   ha.rs           ← HA computation + pattern detection
   flow.rs         ← OrderFlow ratios (MB/MS/LB/LS)
   onchain/        ← GovernanceSignal, OrderbookPressure, StakingFlow, WalletFlow
@@ -41,7 +43,7 @@ adapters/
   pcts/           ← PCTS SQL Server via tiberius (OHLCV)
   sqlite/         ← OMV SQLite via rusqlite (orderbook, cosmos, transfers, wallets, governance)
   composite.rs    ← routing
-  mcp/            ← FlowFunctionServer (16 tools)
+  mcp/            ← FlowFunctionServer (19 tools)
 main.rs           ← bootstrap: reads env, builds adapters, starts HTTP MCP
 ```
 
@@ -75,6 +77,9 @@ main.rs           ← bootstrap: reads env, builds adapters, starts HTTP MCP
 | `order_blocks` | `pair, tf, last_n` | `[{ts, direction, top, bottom, broken}]` |
 | `structure` | `pair, tf, last_n` | `[{ts, event_type, level, direction}]` |
 | `liquidity` | `pair, tf, last_n` | `[{ts, price, side, swept}]` |
+| `fib_confluence` | `pair, tf, last_n?, profile?` | `[{price, strength, direction, levels, atr_compressed, distance_pct}]` |
+| `fib_targets` | `pair, tf, last_n?, entry_price, profile?` | `{current_price, entry_price, pnl_pct, targets, nearest_support, profile, exploratory}` |
+| `harmonic_patterns` | `pair, tf, last_n?, profile?` | `[{ts_x..ts_d, pattern, direction, d_price, xabcd_quality, exploratory}]` |
 
 ### Price Action + Flow
 | Tool | Args | Returns |
@@ -90,24 +95,32 @@ main.rs           ← bootstrap: reads env, builds adapters, starts HTTP MCP
 | `staking_flow` | `last_n?, period_type?` | `cosmos_stake_events` | `[{period, delegated_atom, undelegated_atom, net_atom, flow_direction, event_count}]` |
 | `wallet_flow` | `token, last_n?` | `transfer_events` + `wallet_classifications` | `[{period, exchange_inflow, exchange_outflow, net_flow, flow_direction, transfer_count}]` |
 
+### FibProfile (Fibonacci + Harmonic tool parameter)
+| Profile | cluster_tol | harmonic_tol | harmonic_patterns | exploratory |
+|---------|-------------|--------------|-------------------|-------------|
+| `nascent` | 0.8% | 7% | Gartley, Bat | true |
+| `developing` | 0.5% | 5% | Gartley, Bat, Butterfly | false |
+| `mature` | 0.3% | 3% | Gartley, Bat, Butterfly, Crab | false |
+
 ---
 
 ## Governance
 
-- CQRS: all 16 tools are QUERY — no write operations
-- GitHub Issues only (Epic #1, Stories #2-#7)
+- CQRS: all 19 tools are QUERY — no write operations
+- GitHub Issues: Epic #9 (Fibonacci Extended), Stories #10–#13
 - Mutations require explicit mandaat per global CLAUDE.md
 
 ---
 
 ## Dev Conventions
 
-- **Parse-don't-validate**: `Pair::parse()`, `Timeframe::from_str()`, `Direction::from_str()` at every MCP boundary
-- **Strong typing**: `Direction` enum, `StructureType` enum, `Period(NonZeroU32)` newtype
+- **Parse-don't-validate**: `Pair::parse()`, `Timeframe::from_str()`, `FibProfile::parse()` at every MCP boundary
+- **Strong typing**: `Direction` enum, `StructureType` enum, `FibProfile` newtype-like struct
 - **SoC**: `domain/` has zero imports from `adapters/` or `ports/`
 - **Seed lookback**: fetch `last_n + seed` candles, compute, trim to `last_n` — all indicators aligned
 - **`spawn_blocking`** for all rusqlite calls
 - **Division-by-zero**: all ratio fields are `Option<f64>`, return `None` not panic
+- **Harmonic pivots**: `pivots.rs` is the shared pivot detection module (pub(crate))
 
 ---
 

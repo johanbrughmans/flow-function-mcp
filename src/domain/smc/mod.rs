@@ -2,6 +2,8 @@ pub mod fib_confluence;
 pub mod fib_profile;
 pub mod fib_targets;
 pub mod fvg;
+pub mod harmonics;
 pub mod liquidity;
 pub mod order_blocks;
+pub mod pivots;
 pub mod structure;
