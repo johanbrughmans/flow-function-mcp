@@ -6,6 +6,10 @@
 ///   Price action+flow: ha_pattern, order_flow
 ///   Non-OHLCV        : governance_signal, orderbook_pressure, staking_flow, wallet_flow
 ///
+/// candle_source parameter ("ohlcv" | "ha", default "ohlcv") is available on all
+/// OHLCV and SMC tools (13 total). Excluded: ha_pattern (HA internal), order_flow
+/// (trade-flow volume columns drive the signal).
+///
 /// All OHLCV tools apply a seed lookback: fetch last_n + seed candles,
 /// compute indicators, return the last last_n output points.
 
@@ -21,6 +25,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::{
+    adapters::mcp::candle_source::{apply_candle_source, CandleSource},
     adapters::composite::CompositeAdapter,
     domain::{
         flow::compute_order_flow,
@@ -84,6 +89,8 @@ struct OhlcvIndicatorInput {
     #[schemars(description = "Indicator period (optional, uses default when omitted)")]
     #[serde(default)]
     period: Option<u32>,
+    #[serde(flatten)]
+    source: CandleSource,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -104,6 +111,8 @@ struct MaCrossInput {
     #[schemars(description = "MA type: \"sma\" or \"ema\" (default \"sma\")")]
     #[serde(default)]
     ma_type: Option<String>,
+    #[serde(flatten)]
+    source:  CandleSource,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -121,8 +130,11 @@ struct BollingerInput {
     #[schemars(description = "Number of standard deviations for band width (default 2.0)")]
     #[serde(default)]
     n_std:  Option<f64>,
+    #[serde(flatten)]
+    source: CandleSource,
 }
 
+/// Used by ha_pattern and order_flow — no candle_source (excluded by design).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SmcInput {
     #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
@@ -132,6 +144,20 @@ struct SmcInput {
     #[schemars(description = "Number of candles to analyse (seed lookback applied automatically)")]
     #[serde(default = "default_last_n")]
     last_n: u32,
+}
+
+/// Used by fvg, order_blocks, structure, liquidity — supports candle_source.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SmcSourceInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
+    pair:   String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    tf:     String,
+    #[schemars(description = "Number of candles to analyse (seed lookback applied automatically)")]
+    #[serde(default = "default_last_n")]
+    last_n: u32,
+    #[serde(flatten)]
+    source: CandleSource,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -146,6 +172,8 @@ struct FibConfluenceInput {
     #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
     #[serde(default)]
     profile: Option<String>,
+    #[serde(flatten)]
+    source:  CandleSource,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -162,6 +190,8 @@ struct FibTargetsInput {
     #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
     #[serde(default)]
     profile:     Option<String>,
+    #[serde(flatten)]
+    source:      CandleSource,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -176,6 +206,8 @@ struct HarmonicPatternsInput {
     #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
     #[serde(default)]
     profile: Option<String>,
+    #[serde(flatten)]
+    source:  CandleSource,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -241,7 +273,7 @@ impl FlowFunctionServer {
         description = "Wilder's RSI computed from PCTS OHLCV. \
                        Seed lookback = period candles (fetched automatically). \
                        Returns [{ts, rsi}] ascending. rsi ∈ [0, 100]. \
-                       Default period=14. QUERY — read-only."
+                       Default period=14. candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
     async fn rsi(&self, Parameters(req): Parameters<OhlcvIndicatorInput>) -> Result<String, String> {
         let pair   = parse_pair(&req.pair)?;
@@ -249,6 +281,7 @@ impl FlowFunctionServer {
         let period = period_usize(req.period, RSI_DEFAULT)?;
         let seed   = (period + 1) as u32;
         let raw    = self.fetch_ohlcv(&pair, tf, req.last_n, seed).await?;
+        let raw    = apply_candle_source(raw, &req.source.candle_source)?;
         let pts    = compute_rsi(&raw, period);
         let out: Vec<_> = pts.into_iter().rev().take(req.last_n as usize).rev().collect();
         serde_json::to_string(&out).map_err(|e| e.to_string())
@@ -261,7 +294,7 @@ impl FlowFunctionServer {
         description = "Moving average crossover (SMA or EMA). Fast/slow MA pair with cross detection. \
                        Returns [{ts, fast_ma, slow_ma, cross?}] ascending. \
                        cross: \"bullish\" | \"bearish\" (omitted when no cross). \
-                       Default fast=9, slow=21, ma_type=sma. QUERY — read-only."
+                       Default fast=9, slow=21, ma_type=sma. candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
     async fn ma_cross(&self, Parameters(req): Parameters<MaCrossInput>) -> Result<String, String> {
         let pair    = parse_pair(&req.pair)?;
@@ -274,6 +307,7 @@ impl FlowFunctionServer {
             .unwrap_or(MaType::Sma);
         let seed = slow as u32;
         let raw  = self.fetch_ohlcv(&pair, tf, req.last_n, seed).await?;
+        let raw  = apply_candle_source(raw, &req.source.candle_source)?;
         let pts  = compute_ma_cross(&raw, fast, slow, ma_type);
         let out: Vec<_> = pts.into_iter().rev().take(req.last_n as usize).rev().collect();
         serde_json::to_string(&out).map_err(|e| e.to_string())
@@ -285,7 +319,7 @@ impl FlowFunctionServer {
         name = "atr",
         description = "Average True Range (Wilder's smoothing). \
                        Returns [{ts, atr}] ascending. \
-                       Default period=14. QUERY — read-only."
+                       Default period=14. candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
     async fn atr(&self, Parameters(req): Parameters<OhlcvIndicatorInput>) -> Result<String, String> {
         let pair   = parse_pair(&req.pair)?;
@@ -293,6 +327,7 @@ impl FlowFunctionServer {
         let period = period_usize(req.period, ATR_DEFAULT)?;
         let seed   = (period + 1) as u32;
         let raw    = self.fetch_ohlcv(&pair, tf, req.last_n, seed).await?;
+        let raw    = apply_candle_source(raw, &req.source.candle_source)?;
         let pts    = compute_atr(&raw, period);
         let out: Vec<_> = pts.into_iter().rev().take(req.last_n as usize).rev().collect();
         serde_json::to_string(&out).map_err(|e| e.to_string())
@@ -305,7 +340,7 @@ impl FlowFunctionServer {
         description = "Bollinger Bands (SMA ± n_std × σ). \
                        Returns [{ts, middle, upper, lower, width, pct_b}] ascending. \
                        pct_b = (close−lower)/(upper−lower); can exceed [0,1]. \
-                       Default period=20, n_std=2.0. QUERY — read-only."
+                       Default period=20, n_std=2.0. candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
     async fn bollinger(&self, Parameters(req): Parameters<BollingerInput>) -> Result<String, String> {
         let pair   = parse_pair(&req.pair)?;
@@ -314,6 +349,7 @@ impl FlowFunctionServer {
         let n_std  = req.n_std.unwrap_or(DEFAULT_N_STD);
         let seed   = period as u32;
         let raw    = self.fetch_ohlcv(&pair, tf, req.last_n, seed).await?;
+        let raw    = apply_candle_source(raw, &req.source.candle_source)?;
         let pts    = compute_bollinger(&raw, period, n_std);
         let out: Vec<_> = pts.into_iter().rev().take(req.last_n as usize).rev().collect();
         serde_json::to_string(&out).map_err(|e| e.to_string())
@@ -325,7 +361,7 @@ impl FlowFunctionServer {
         name = "donchian",
         description = "Donchian Channels — rolling highest high / lowest low. \
                        Returns [{ts, upper, mid, lower, width}] ascending. \
-                       Default period=20. QUERY — read-only."
+                       Default period=20. candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
     async fn donchian(&self, Parameters(req): Parameters<OhlcvIndicatorInput>) -> Result<String, String> {
         let pair   = parse_pair(&req.pair)?;
@@ -333,6 +369,7 @@ impl FlowFunctionServer {
         let period = period_usize(req.period, DONCH_DEFAULT)?;
         let seed   = period as u32;
         let raw    = self.fetch_ohlcv(&pair, tf, req.last_n, seed).await?;
+        let raw    = apply_candle_source(raw, &req.source.candle_source)?;
         let pts    = compute_donchian(&raw, period);
         let out: Vec<_> = pts.into_iter().rev().take(req.last_n as usize).rev().collect();
         serde_json::to_string(&out).map_err(|e| e.to_string())
@@ -345,7 +382,8 @@ impl FlowFunctionServer {
         description = "Historical Volatility (HV) — annualised close-to-close log-return std dev. \
                        Returns [{ts, hv}] ascending. hv is in percent (e.g. 42.3 = 42.3% annualised). \
                        Annualisation factor derived automatically from the timeframe. \
-                       Default period=20 (sample std dev, n-1 denominator). QUERY — read-only."
+                       Default period=20 (sample std dev, n-1 denominator). \
+                       candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
     async fn volatility(&self, Parameters(req): Parameters<OhlcvIndicatorInput>) -> Result<String, String> {
         let pair   = parse_pair(&req.pair)?;
@@ -353,6 +391,7 @@ impl FlowFunctionServer {
         let period = period_usize(req.period, HV_DEFAULT)?;
         let seed   = (period + 1) as u32;
         let raw    = self.fetch_ohlcv(&pair, tf.clone(), req.last_n, seed).await?;
+        let raw    = apply_candle_source(raw, &req.source.candle_source)?;
         let pts    = compute_hv(&raw, period, &tf);
         let out: Vec<_> = pts.into_iter().rev().take(req.last_n as usize).rev().collect();
         serde_json::to_string(&out).map_err(|e| e.to_string())
@@ -367,12 +406,13 @@ impl FlowFunctionServer {
                        bearish FVG when C.high < A.low. \
                        Returns [{ts, direction, top, bottom, filled}] sorted by ts. \
                        filled: price has since traded back into the gap zone. \
-                       QUERY — read-only."
+                       candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
-    async fn fvg(&self, Parameters(req): Parameters<SmcInput>) -> Result<String, String> {
+    async fn fvg(&self, Parameters(req): Parameters<SmcSourceInput>) -> Result<String, String> {
         let pair  = parse_pair(&req.pair)?;
         let tf    = parse_tf(&req.tf)?;
         let raw   = self.fetch_ohlcv(&pair, tf, req.last_n, 50).await?;
+        let raw   = apply_candle_source(raw, &req.source.candle_source)?;
         let zones = compute_fvg(&raw);
         serde_json::to_string(&zones).map_err(|e| e.to_string())
     }
@@ -386,12 +426,13 @@ impl FlowFunctionServer {
                        Bearish OB: last bullish candle before a strong bearish impulse (close < OB low). \
                        Returns [{ts, direction, top, bottom, broken}] sorted by ts. \
                        broken: price has since closed beyond the opposite side of the OB. \
-                       QUERY — read-only."
+                       candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
-    async fn order_blocks(&self, Parameters(req): Parameters<SmcInput>) -> Result<String, String> {
+    async fn order_blocks(&self, Parameters(req): Parameters<SmcSourceInput>) -> Result<String, String> {
         let pair   = parse_pair(&req.pair)?;
         let tf     = parse_tf(&req.tf)?;
         let raw    = self.fetch_ohlcv(&pair, tf, req.last_n, 50).await?;
+        let raw    = apply_candle_source(raw, &req.source.candle_source)?;
         let blocks = compute_order_blocks(&raw);
         serde_json::to_string(&blocks).map_err(|e| e.to_string())
     }
@@ -405,12 +446,13 @@ impl FlowFunctionServer {
                        CHoCH (Change of Character): close breaks last swing high/low AGAINST prior direction. \
                        Returns [{ts, event_type, level, direction}] sorted by ts. \
                        event_type: \"bos\" | \"choch\". direction: \"bullish\" | \"bearish\". \
-                       QUERY — read-only."
+                       candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
-    async fn structure(&self, Parameters(req): Parameters<SmcInput>) -> Result<String, String> {
+    async fn structure(&self, Parameters(req): Parameters<SmcSourceInput>) -> Result<String, String> {
         let pair   = parse_pair(&req.pair)?;
         let tf     = parse_tf(&req.tf)?;
         let raw    = self.fetch_ohlcv(&pair, tf, req.last_n, 50).await?;
+        let raw    = apply_candle_source(raw, &req.source.candle_source)?;
         let events = compute_structure(&raw);
         serde_json::to_string(&events).map_err(|e| e.to_string())
     }
@@ -424,12 +466,13 @@ impl FlowFunctionServer {
                        sell_side: equal lows within 0.1% — stop clusters below. \
                        Returns [{ts, price, side, swept}] sorted by ts. \
                        swept: price has since traded through the level. \
-                       QUERY — read-only."
+                       candle_source: \"ohlcv\"(default) | \"ha\". QUERY — read-only."
     )]
-    async fn liquidity(&self, Parameters(req): Parameters<SmcInput>) -> Result<String, String> {
+    async fn liquidity(&self, Parameters(req): Parameters<SmcSourceInput>) -> Result<String, String> {
         let pair   = parse_pair(&req.pair)?;
         let tf     = parse_tf(&req.tf)?;
         let raw    = self.fetch_ohlcv(&pair, tf, req.last_n, 50).await?;
+        let raw    = apply_candle_source(raw, &req.source.candle_source)?;
         let levels = compute_liquidity(&raw);
         serde_json::to_string(&levels).map_err(|e| e.to_string())
     }
@@ -446,7 +489,7 @@ impl FlowFunctionServer {
                        Returns [{price, strength, direction, levels, atr_compressed, distance_pct}] nearest-first. \
                        direction: \"support\" (below close) | \"resistance\" (above close). \
                        profile: \"nascent\" (0.8% tol, min 2) | \"developing\" (0.5%, min 2) | \"mature\" (0.3%, min 3, default). \
-                       Default last_n=200 candles. QUERY — read-only."
+                       candle_source: \"ohlcv\"(default) | \"ha\". Default last_n=200 candles. QUERY — read-only."
     )]
     async fn fib_confluence(&self, Parameters(req): Parameters<FibConfluenceInput>) -> Result<String, String> {
         let pair    = parse_pair(&req.pair)?;
@@ -454,6 +497,7 @@ impl FlowFunctionServer {
         let profile = parse_profile(req.profile)?;
         let n       = req.last_n.max(50);
         let raw     = self.fetch_ohlcv(&pair, tf, n, 50).await?;
+        let raw     = apply_candle_source(raw, &req.source.candle_source)?;
         let zones   = compute_fib_confluence(&raw, &profile);
         serde_json::to_string(&zones).map_err(|e| e.to_string())
     }
@@ -470,6 +514,7 @@ impl FlowFunctionServer {
                        distance_from_entry_pct negative when target is below entry (underwater position). \
                        nearest_support: strongest support cluster within 20% below current price. \
                        profile: \"nascent\" | \"developing\" | \"mature\" (default). \
+                       candle_source: \"ohlcv\"(default) | \"ha\". \
                        exploratory=true when profile=nascent — lower signal confidence. \
                        Default last_n=200. QUERY — read-only."
     )]
@@ -479,6 +524,7 @@ impl FlowFunctionServer {
         let profile = parse_profile(req.profile)?;
         let n       = req.last_n.max(50);
         let raw     = self.fetch_ohlcv(&pair, tf, n, 50).await?;
+        let raw     = apply_candle_source(raw, &req.source.candle_source)?;
         let result  = compute_fib_targets(&raw, req.entry_price, &profile)?;
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
@@ -497,6 +543,7 @@ impl FlowFunctionServer {
                        xabcd_quality 0.0–1.0: closeness to ideal ratios (D×60%, AB×40%). \
                        profile: \"nascent\" (Gartley+Bat, tol=7%) | \"developing\" (Gartley+Bat+Butterfly, tol=5%) \
                        | \"mature\" (all 4 patterns, tol=3%, default). \
+                       candle_source: \"ohlcv\"(default) | \"ha\". \
                        Default last_n=200. QUERY — read-only."
     )]
     async fn harmonic_patterns(&self, Parameters(req): Parameters<HarmonicPatternsInput>) -> Result<String, String> {
@@ -505,6 +552,7 @@ impl FlowFunctionServer {
         let profile = parse_profile(req.profile)?;
         let n       = req.last_n.max(50);
         let raw     = self.fetch_ohlcv(&pair, tf, n, 50).await?;
+        let raw     = apply_candle_source(raw, &req.source.candle_source)?;
         let found   = compute_harmonic_patterns(&raw, &profile);
         serde_json::to_string(&found).map_err(|e| e.to_string())
     }
@@ -660,15 +708,16 @@ impl ServerHandler for FlowFunctionServer {
         .with_server_info(Implementation::new("flow-function-mcp", env!("CARGO_PKG_VERSION")))
         .with_instructions(
             "Function Layer — Stateless signal computation (TGF Layer 3). All tools are QUERY (read-only).\n\
+             candle_source: \"ohlcv\"(default, raw PCTS) | \"ha\"(Heikin Ashi smoothed) — available on all OHLCV and SMC tools.\n\
              OHLCV Indicators (from PCTS SQL Server):\n\
-               rsi {pair,tf,last_n,period?} | ma_cross {pair,tf,last_n,fast?,slow?,ma_type?} | \
-               atr {pair,tf,last_n,period?} | bollinger {pair,tf,last_n,period?,n_std?} | \
-               donchian {pair,tf,last_n,period?} | volatility {pair,tf,last_n,period?}\n\
+               rsi {pair,tf,last_n,period?,candle_source?} | ma_cross {pair,tf,last_n,fast?,slow?,ma_type?,candle_source?} | \
+               atr {pair,tf,last_n,period?,candle_source?} | bollinger {pair,tf,last_n,period?,n_std?,candle_source?} | \
+               donchian {pair,tf,last_n,period?,candle_source?} | volatility {pair,tf,last_n,period?,candle_source?}\n\
              SMC (from PCTS SQL Server):\n\
-               fvg {pair,tf,last_n} | order_blocks {pair,tf,last_n} | \
-               structure {pair,tf,last_n} | liquidity {pair,tf,last_n} | \
-               fib_confluence {pair,tf,last_n?,profile?} | fib_targets {pair,tf,last_n?,entry_price,profile?} | \
-               harmonic_patterns {pair,tf,last_n?,profile?}\n\
+               fvg {pair,tf,last_n,candle_source?} | order_blocks {pair,tf,last_n,candle_source?} | \
+               structure {pair,tf,last_n,candle_source?} | liquidity {pair,tf,last_n,candle_source?} | \
+               fib_confluence {pair,tf,last_n?,profile?,candle_source?} | fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
+               harmonic_patterns {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\
                ha_pattern {pair,tf,last_n} | order_flow {pair,tf,last_n}\n\
              Non-OHLCV (from OMV SQLite):\n\

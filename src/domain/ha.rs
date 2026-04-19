@@ -3,12 +3,15 @@
 /// compute_ha_patterns is the Function-layer output:
 ///   same HA formula as Infrastructure, but enriched with consecutive_count,
 ///   reversal flag, and lower_wick_signal for the MCP tool response.
+///
+/// ohlcv_to_ha is a utility for indicator tools that accept candle_source="ha":
+///   returns OhlcvCandle vec with HA-smoothed OHLC values; volume/trade-flow preserved.
 
 use crate::domain::candle::{HaCandle, HaColor, OhlcvCandle};
 
 pub const SEED_LOOKBACK: usize = 10;
 
-// ── Base HA computation (shared with indicators that need HA) ─────────────────
+// ── Base HA computation (returns HaCandle — used by ha_pattern tool) ──────────
 
 pub fn compute_ha(raw: &[OhlcvCandle], requested: usize) -> Vec<HaCandle> {
     if raw.is_empty() { return vec![]; }
@@ -37,6 +40,49 @@ pub fn compute_ha(raw: &[OhlcvCandle], requested: usize) -> Vec<HaCandle> {
 
     let skip = result.len().saturating_sub(requested);
     result.into_iter().skip(skip).collect()
+}
+
+// ── HA-smoothed OhlcvCandle conversion (used when candle_source="ha") ─────────
+
+/// Convert raw OHLCV candles to Heikin Ashi OHLCV candles.
+/// OHLC values are replaced with HA values; volume + trade-flow columns are preserved.
+/// Output length equals input length.
+pub fn ohlcv_to_ha(raw: &[OhlcvCandle]) -> Vec<OhlcvCandle> {
+    if raw.is_empty() { return vec![]; }
+
+    let mut prev_ha_open:  f64 = 0.0;
+    let mut prev_ha_close: f64 = 0.0;
+    let mut result = Vec::with_capacity(raw.len());
+
+    for (i, c) in raw.iter().enumerate() {
+        let ha_close = (c.open + c.high + c.low + c.close) / 4.0;
+        let ha_open  = if i == 0 { (c.open + c.close) / 2.0 }
+                       else       { (prev_ha_open + prev_ha_close) / 2.0 };
+        let ha_high  = c.high.max(ha_open).max(ha_close);
+        let ha_low   = c.low.min(ha_open).min(ha_close);
+
+        prev_ha_open  = ha_open;
+        prev_ha_close = ha_close;
+
+        result.push(OhlcvCandle {
+            ts:       c.ts.clone(),
+            open:     ha_open,
+            high:     ha_high,
+            low:      ha_low,
+            close:    ha_close,
+            volume:   c.volume,
+            mb_vol:   c.mb_vol,
+            ms_vol:   c.ms_vol,
+            lb_vol:   c.lb_vol,
+            ls_vol:   c.ls_vol,
+            mb_count: c.mb_count,
+            ms_count: c.ms_count,
+            lb_count: c.lb_count,
+            ls_count: c.ls_count,
+        });
+    }
+
+    result
 }
 
 fn classify(ha_open: f64, ha_close: f64, prev_ha_open: f64, index: usize) -> HaColor {
@@ -69,7 +115,6 @@ pub struct HaPattern {
 pub fn compute_ha_patterns(raw: &[OhlcvCandle], requested: usize) -> Vec<HaPattern> {
     if raw.is_empty() { return vec![]; }
 
-    // Compute full HA sequence so seed candles warm the open formula.
     let all_ha = compute_ha(raw, raw.len());
     let mut patterns: Vec<HaPattern> = Vec::with_capacity(all_ha.len());
     let mut run: u32 = 1;
@@ -109,6 +154,8 @@ mod tests {
         }
     }
 
+    // ── compute_ha_patterns ───────────────────────────────────────────────────
+
     #[test]
     fn empty_input_returns_empty() { assert!(compute_ha_patterns(&[], 10).is_empty()); }
 
@@ -137,5 +184,70 @@ mod tests {
             assert!(result[0].has_lower_wick);
             assert!(matches!(result[0].color, HaColor::Blue | HaColor::Green));
         }
+    }
+
+    // ── ohlcv_to_ha ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn ohlcv_to_ha_empty_returns_empty() {
+        assert!(ohlcv_to_ha(&[]).is_empty());
+    }
+
+    #[test]
+    fn ohlcv_to_ha_length_preserved() {
+        let raw: Vec<_> = (0..5).map(|i| c(&i.to_string(), 1.0, 2.0, 0.5, 1.5)).collect();
+        assert_eq!(ohlcv_to_ha(&raw).len(), 5);
+    }
+
+    #[test]
+    fn ohlcv_to_ha_first_candle_initialization() {
+        let raw = vec![c("0", 1.0, 2.0, 0.5, 1.5)];
+        let ha  = ohlcv_to_ha(&raw);
+        // ha_close = (1.0+2.0+0.5+1.5)/4 = 1.25
+        // ha_open  = (1.0+1.5)/2          = 1.25
+        assert!((ha[0].close - 1.25).abs() < 1e-9);
+        assert!((ha[0].open  - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ohlcv_to_ha_second_candle_uses_previous_ha() {
+        let raw = vec![
+            c("0", 1.0, 2.0, 0.5, 1.5),
+            c("1", 2.0, 3.0, 1.5, 2.5),
+        ];
+        let ha            = ohlcv_to_ha(&raw);
+        let ha0_open      = (1.0 + 1.5) / 2.0;
+        let ha0_close     = (1.0 + 2.0 + 0.5 + 1.5) / 4.0;
+        let expected_open1 = (ha0_open + ha0_close) / 2.0;
+        assert!((ha[1].open - expected_open1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ohlcv_to_ha_high_is_max_of_high_ha_open_ha_close() {
+        let raw: Vec<_> = (0..5).map(|i| c(&i.to_string(), 1.0, 2.0, 0.5, 1.5)).collect();
+        for h in ohlcv_to_ha(&raw) {
+            assert!(h.high >= h.open.max(h.close) - 1e-9);
+        }
+    }
+
+    #[test]
+    fn ohlcv_to_ha_low_is_min_of_low_ha_open_ha_close() {
+        let raw: Vec<_> = (0..5).map(|i| c(&i.to_string(), 1.0, 2.0, 0.5, 1.5)).collect();
+        for h in ohlcv_to_ha(&raw) {
+            assert!(h.low <= h.open.min(h.close) + 1e-9);
+        }
+    }
+
+    #[test]
+    fn ohlcv_to_ha_volume_and_flow_columns_preserved() {
+        let mut raw = vec![c("0", 1.0, 2.0, 0.5, 1.5)];
+        raw[0].mb_vol   = Some(100.0);
+        raw[0].ms_vol   = Some(50.0);
+        raw[0].mb_count = Some(10);
+        let ha = ohlcv_to_ha(&raw);
+        assert_eq!(ha[0].volume,   100.0);
+        assert_eq!(ha[0].mb_vol,   Some(100.0));
+        assert_eq!(ha[0].ms_vol,   Some(50.0));
+        assert_eq!(ha[0].mb_count, Some(10));
     }
 }

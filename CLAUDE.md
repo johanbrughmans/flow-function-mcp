@@ -28,7 +28,7 @@ domain/           ← zero I/O; pure computation functions
   smc/            ← FVG, OrderBlocks, Structure, Liquidity
                     fib_confluence, fib_targets, harmonic_patterns
                     pivots (shared pivot detection), fib_profile
-  ha.rs           ← HA computation + pattern detection
+  ha.rs           ← HA computation + pattern detection + ohlcv_to_ha()
   flow.rs         ← OrderFlow ratios (MB/MS/LB/LS)
   onchain/        ← GovernanceSignal, OrderbookPressure, StakingFlow, WalletFlow
   types.rs        ← Direction, StructureType, Zone, Level, Period
@@ -43,7 +43,9 @@ adapters/
   pcts/           ← PCTS SQL Server via tiberius (OHLCV)
   sqlite/         ← OMV SQLite via rusqlite (orderbook, cosmos, transfers, wallets, governance)
   composite.rs    ← routing
-  mcp/            ← FlowFunctionServer (19 tools)
+  mcp/
+    candle_source.rs ← CandleSource struct + apply_candle_source (shared by all OHLCV tools)
+    server.rs        ← FlowFunctionServer (19 tools)
 main.rs           ← bootstrap: reads env, builds adapters, starts HTTP MCP
 ```
 
@@ -60,32 +62,32 @@ main.rs           ← bootstrap: reads env, builds adapters, starts HTTP MCP
 
 ## MCP Tools (all QUERY, read-only)
 
-### OHLCV Indicators
+### OHLCV Indicators — support `candle_source?`
 | Tool | Args | Returns |
 |------|------|---------|
-| `rsi` | `pair, tf, last_n, period?` | `[{ts, rsi}]` |
-| `ma_cross` | `pair, tf, last_n, fast?, slow?, ma_type?` | `[{ts, fast_ma, slow_ma, cross?}]` |
-| `atr` | `pair, tf, last_n, period?` | `[{ts, atr}]` |
-| `bollinger` | `pair, tf, last_n, period?, n_std?` | `[{ts, middle, upper, lower, width, pct_b}]` |
-| `donchian` | `pair, tf, last_n, period?` | `[{ts, upper, mid, lower, width}]` |
-| `volatility` | `pair, tf, last_n, period?` | `[{ts, hv}]` (annualised %) |
+| `rsi` | `pair, tf, last_n, period?, candle_source?` | `[{ts, rsi}]` |
+| `ma_cross` | `pair, tf, last_n, fast?, slow?, ma_type?, candle_source?` | `[{ts, fast_ma, slow_ma, cross?}]` |
+| `atr` | `pair, tf, last_n, period?, candle_source?` | `[{ts, atr}]` |
+| `bollinger` | `pair, tf, last_n, period?, n_std?, candle_source?` | `[{ts, middle, upper, lower, width, pct_b}]` |
+| `donchian` | `pair, tf, last_n, period?, candle_source?` | `[{ts, upper, mid, lower, width}]` |
+| `volatility` | `pair, tf, last_n, period?, candle_source?` | `[{ts, hv}]` (annualised %) |
 
-### Smart Money Concepts
+### Smart Money Concepts — support `candle_source?`
 | Tool | Args | Returns |
 |------|------|---------|
-| `fvg` | `pair, tf, last_n` | `[{ts, direction, top, bottom, filled}]` |
-| `order_blocks` | `pair, tf, last_n` | `[{ts, direction, top, bottom, broken}]` |
-| `structure` | `pair, tf, last_n` | `[{ts, event_type, level, direction}]` |
-| `liquidity` | `pair, tf, last_n` | `[{ts, price, side, swept}]` |
-| `fib_confluence` | `pair, tf, last_n?, profile?` | `[{price, strength, direction, levels, atr_compressed, distance_pct}]` |
-| `fib_targets` | `pair, tf, last_n?, entry_price, profile?` | `{current_price, entry_price, pnl_pct, targets, nearest_support, profile, exploratory}` |
-| `harmonic_patterns` | `pair, tf, last_n?, profile?` | `[{ts_x..ts_d, pattern, direction, d_price, xabcd_quality, exploratory}]` |
+| `fvg` | `pair, tf, last_n, candle_source?` | `[{ts, direction, top, bottom, filled}]` |
+| `order_blocks` | `pair, tf, last_n, candle_source?` | `[{ts, direction, top, bottom, broken}]` |
+| `structure` | `pair, tf, last_n, candle_source?` | `[{ts, event_type, level, direction}]` |
+| `liquidity` | `pair, tf, last_n, candle_source?` | `[{ts, price, side, swept}]` |
+| `fib_confluence` | `pair, tf, last_n?, profile?, candle_source?` | `[{price, strength, direction, levels, atr_compressed, distance_pct}]` |
+| `fib_targets` | `pair, tf, last_n?, entry_price, profile?, candle_source?` | `{current_price, entry_price, pnl_pct, targets, nearest_support, profile, exploratory}` |
+| `harmonic_patterns` | `pair, tf, last_n?, profile?, candle_source?` | `[{ts_x..ts_d, pattern, direction, d_price, xabcd_quality, exploratory}]` |
 
-### Price Action + Flow
-| Tool | Args | Returns |
-|------|------|---------|
-| `ha_pattern` | `pair, tf, last_n` | `[{ts, color, has_lower_wick, has_upper_wick, consecutive_count, reversal, lower_wick_signal}]` |
-| `order_flow` | `pair, tf, last_n` | `[{ts, mb_ms_ratio?, lb_ls_ratio?, net_aggression?, market_pct?, avg_mb_size?, avg_ms_size?}]` |
+### Price Action + Flow — no `candle_source` (excluded by design)
+| Tool | Args | Returns | Why excluded |
+|------|------|---------|-------------|
+| `ha_pattern` | `pair, tf, last_n` | `[{ts, color, has_lower_wick, has_upper_wick, consecutive_count, reversal, lower_wick_signal}]` | Already HA internally |
+| `order_flow` | `pair, tf, last_n` | `[{ts, mb_ms_ratio?, lb_ls_ratio?, net_aggression?, market_pct?, avg_mb_size?, avg_ms_size?}]` | MB/MS/LB/LS columns drive the signal |
 
 ### Non-OHLCV (different data sources — see ADR-005)
 | Tool | Args | Source | Returns |
@@ -107,7 +109,7 @@ main.rs           ← bootstrap: reads env, builds adapters, starts HTTP MCP
 ## Governance
 
 - CQRS: all 19 tools are QUERY — no write operations
-- GitHub Issues: Epic #9 (Fibonacci Extended), Stories #10–#13
+- GitHub Issues: Epic #9 (Fibonacci Extended), Stories #10–#14
 - Mutations require explicit mandaat per global CLAUDE.md
 
 ---
@@ -121,6 +123,13 @@ main.rs           ← bootstrap: reads env, builds adapters, starts HTTP MCP
 - **`spawn_blocking`** for all rusqlite calls
 - **Division-by-zero**: all ratio fields are `Option<f64>`, return `None` not panic
 - **Harmonic pivots**: `pivots.rs` is the shared pivot detection module (pub(crate))
+- **CandleSource convention**: every new OHLCV tool input struct MUST include:
+  ```rust
+  #[serde(flatten)]
+  source: CandleSource,
+  ```
+  Then call `apply_candle_source(raw, &req.source.candle_source)?` after fetching OHLCV.
+  Omit only for tools where HA OHLC has no semantic meaning (ha_pattern, order_flow).
 
 ---
 
