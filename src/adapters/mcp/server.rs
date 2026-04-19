@@ -1,8 +1,8 @@
 /// FlowFunctionServer — MCP inbound adapter (Function Layer, TGF Layer 3).
 ///
-/// 17 QUERY tools (read-only):
+/// 18 QUERY tools (read-only):
 ///   OHLCV indicators : rsi, ma_cross, atr, bollinger, donchian, volatility
-///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence
+///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence, fib_targets
 ///   Price action+flow: ha_pattern, order_flow
 ///   Non-OHLCV        : governance_signal, orderbook_pressure, staking_flow, wallet_flow
 ///
@@ -42,6 +42,8 @@ use crate::{
         pair::Pair,
         smc::{
             fib_confluence::compute_fib_confluence,
+            fib_profile::FibProfile,
+            fib_targets::compute_fib_targets,
             fvg::compute_fvg,
             liquidity::compute_liquidity,
             order_blocks::compute_order_blocks,
@@ -134,12 +136,31 @@ struct SmcInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FibConfluenceInput {
     #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
-    pair:   String,
+    pair:    String,
     #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
-    tf:     String,
+    tf:      String,
     #[schemars(description = "Candles to scan for swing pivots (default 200, min 50)")]
     #[serde(default = "default_fib_last_n")]
-    last_n: u32,
+    last_n:  u32,
+    #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FibTargetsInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
+    pair:        String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    tf:          String,
+    #[schemars(description = "Candles to scan for swing pivots (default 200, min 50)")]
+    #[serde(default = "default_fib_last_n")]
+    last_n:      u32,
+    #[schemars(description = "Entry price paid — must be > 0")]
+    entry_price: f64,
+    #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
+    #[serde(default)]
+    profile:     Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -184,6 +205,9 @@ fn default_fib_last_n() -> u32 { 200 }
 
 fn parse_pair(s: &str) -> Result<Pair, String>      { Pair::parse(s).map_err(|e| e.to_string()) }
 fn parse_tf(s: &str)   -> Result<Timeframe, String> { s.parse::<Timeframe>().map_err(|e| e.to_string()) }
+fn parse_profile(opt: Option<String>) -> Result<FibProfile, String> {
+    FibProfile::parse(opt.as_deref().unwrap_or("mature"))
+}
 
 fn period_usize(opt: Option<u32>, default: usize) -> Result<usize, String> {
     let n = opt.map_or(default, |v| v as usize);
@@ -331,9 +355,9 @@ impl FlowFunctionServer {
                        QUERY — read-only."
     )]
     async fn fvg(&self, Parameters(req): Parameters<SmcInput>) -> Result<String, String> {
-        let pair = parse_pair(&req.pair)?;
-        let tf   = parse_tf(&req.tf)?;
-        let raw  = self.fetch_ohlcv(&pair, tf, req.last_n, 50).await?;
+        let pair  = parse_pair(&req.pair)?;
+        let tf    = parse_tf(&req.tf)?;
+        let raw   = self.fetch_ohlcv(&pair, tf, req.last_n, 50).await?;
         let zones = compute_fvg(&raw);
         serde_json::to_string(&zones).map_err(|e| e.to_string())
     }
@@ -403,22 +427,45 @@ impl FlowFunctionServer {
                        Detects swing pivots (3-bar high/low), then computes: \
                        Retracements 38.2/50.0/61.8% from each A→B leg (DiNapoli primary set); \
                        Expansions COP=61.8%, OP=100%, XOP=161.8% from ABC patterns (DiNapoli 1998). \
-                       Clusters all levels within 0.3% price tolerance (Boroden standard). \
-                       Returns only clusters with ≥3 distinct levels, sorted nearest-first. \
-                       atr_compressed=true when current ATR < 75% of 20-bar mean (squeeze at Fib zone). \
-                       Returns [{price, strength, direction, levels, atr_compressed, distance_pct}]. \
+                       Clusters levels within tolerance (profile-controlled). \
+                       Returns [{price, strength, direction, levels, atr_compressed, distance_pct}] nearest-first. \
                        direction: \"support\" (below close) | \"resistance\" (above close). \
-                       levels: [{label, price, anchor_ts}] — constituent Fibonacci levels. \
-                       Default last_n=200 candles (recommended for adequate swing history). \
-                       QUERY — read-only."
+                       profile: \"nascent\" (0.8% tol, min 2) | \"developing\" (0.5%, min 2) | \"mature\" (0.3%, min 3, default). \
+                       Default last_n=200 candles. QUERY — read-only."
     )]
     async fn fib_confluence(&self, Parameters(req): Parameters<FibConfluenceInput>) -> Result<String, String> {
-        let pair  = parse_pair(&req.pair)?;
-        let tf    = parse_tf(&req.tf)?;
-        let n     = req.last_n.max(50);
-        let raw   = self.fetch_ohlcv(&pair, tf, n, 50).await?;
-        let zones = compute_fib_confluence(&raw);
+        let pair    = parse_pair(&req.pair)?;
+        let tf      = parse_tf(&req.tf)?;
+        let profile = parse_profile(req.profile)?;
+        let n       = req.last_n.max(50);
+        let raw     = self.fetch_ohlcv(&pair, tf, n, 50).await?;
+        let zones   = compute_fib_confluence(&raw, &profile);
         serde_json::to_string(&zones).map_err(|e| e.to_string())
+    }
+
+    // ── Fibonacci Targets ──────────────────────────────────────────────────────
+
+    #[tool(
+        name = "fib_targets",
+        description = "DiNapoli take-profit targets from Fibonacci Confluence for a given entry price. \
+                       Returns resistance clusters above current price as actionable TP levels \
+                       plus the nearest support cluster below (stop-loss reference). \
+                       Output: {current_price, entry_price, pnl_pct, targets, nearest_support, profile, exploratory}. \
+                       targets: [{price, strength, distance_from_current_pct, distance_from_entry_pct}] ascending. \
+                       distance_from_entry_pct negative when target is below entry (underwater position). \
+                       nearest_support: strongest support cluster within 20% below current price. \
+                       profile: \"nascent\" | \"developing\" | \"mature\" (default). \
+                       exploratory=true when profile=nascent — lower signal confidence. \
+                       Default last_n=200. QUERY — read-only."
+    )]
+    async fn fib_targets(&self, Parameters(req): Parameters<FibTargetsInput>) -> Result<String, String> {
+        let pair    = parse_pair(&req.pair)?;
+        let tf      = parse_tf(&req.tf)?;
+        let profile = parse_profile(req.profile)?;
+        let n       = req.last_n.max(50);
+        let raw     = self.fetch_ohlcv(&pair, tf, n, 50).await?;
+        let result  = compute_fib_targets(&raw, req.entry_price, &profile)?;
+        serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
     // ── HA Pattern ─────────────────────────────────────────────────────────────
@@ -436,11 +483,11 @@ impl FlowFunctionServer {
                        QUERY — read-only."
     )]
     async fn ha_pattern(&self, Parameters(req): Parameters<SmcInput>) -> Result<String, String> {
-        let pair    = parse_pair(&req.pair)?;
-        let tf      = parse_tf(&req.tf)?;
-        let seed    = SEED_LOOKBACK as u32;
-        let raw     = self.fetch_ohlcv(&pair, tf, req.last_n, seed).await?;
-        let pts     = compute_ha_patterns(&raw, req.last_n as usize);
+        let pair = parse_pair(&req.pair)?;
+        let tf   = parse_tf(&req.tf)?;
+        let seed = SEED_LOOKBACK as u32;
+        let raw  = self.fetch_ohlcv(&pair, tf, req.last_n, seed).await?;
+        let pts  = compute_ha_patterns(&raw, req.last_n as usize);
         serde_json::to_string(&pts).map_err(|e| e.to_string())
     }
 
@@ -477,8 +524,8 @@ impl FlowFunctionServer {
                        Omit pair for all configured pairs. QUERY — read-only."
     )]
     async fn governance_signal(&self, Parameters(req): Parameters<OptionalPairInput>) -> Result<String, String> {
-        let pair = req.pair.as_deref().map(parse_pair).transpose()?;
-        let snaps = self.adapter.governance(pair.as_ref()).await.map_err(|e| e.to_string())?;
+        let pair    = req.pair.as_deref().map(parse_pair).transpose()?;
+        let snaps   = self.adapter.governance(pair.as_ref()).await.map_err(|e| e.to_string())?;
         let signals: Vec<_> = snaps.iter().map(compute_governance_signal).collect();
         serde_json::to_string(&signals).map_err(|e| e.to_string())
     }
@@ -579,12 +626,13 @@ impl ServerHandler for FlowFunctionServer {
              SMC (from PCTS SQL Server):\n\
                fvg {pair,tf,last_n} | order_blocks {pair,tf,last_n} | \
                structure {pair,tf,last_n} | liquidity {pair,tf,last_n} | \
-               fib_confluence {pair,tf,last_n?}\n\
+               fib_confluence {pair,tf,last_n?,profile?} | fib_targets {pair,tf,last_n?,entry_price,profile?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\
                ha_pattern {pair,tf,last_n} | order_flow {pair,tf,last_n}\n\
              Non-OHLCV (from OMV SQLite):\n\
                governance_signal {pair?} | orderbook_pressure {pair,last_n?} | \
                staking_flow {last_n?,period_type?} | wallet_flow {token,last_n?}\n\
+             FibProfile: nascent (0.8% tol, exploratory) | developing (0.5%) | mature (0.3% Boroden, default).\n\
              Pairs: ENJEUR, BTCEUR, ATOMEUR, ETHEUR."
         )
     }

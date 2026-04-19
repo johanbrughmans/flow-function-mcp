@@ -1,18 +1,22 @@
 /// Fibonacci Confluence — DiNapoli/Boroden methodology.
 ///
+/// Parameters are controlled by `FibProfile` — see `fib_profile.rs` for canonical sets.
+///
 /// Retracements: 38.2%, 50.0%, 61.8% (DiNapoli primary entry levels).
 /// Expansions from ABC pattern:
 ///   COP = C ± AB × 0.618   (Contracted Objective Point)
 ///   OP  = C ± AB × 1.000   (Objective Point)
 ///   XOP = C ± AB × 1.618   (Expanded Objective Point)
-/// Cluster tolerance: 0.3% (Boroden standard).
-/// Minimum cluster strength: 3 distinct levels.
-/// ATR compression: current ATR < 75% of the trailing 20-bar ATR mean.
+/// Cluster tolerance and minimum cluster size come from the profile.
+/// ATR compression parameters also come from the profile.
 
-use crate::domain::{candle::OhlcvCandle, indicators::atr::compute_atr};
+use crate::domain::{
+    candle::OhlcvCandle,
+    indicators::atr::compute_atr,
+    smc::fib_profile::FibProfile,
+};
 
-pub const CLUSTER_TOLERANCE:    f64   = 0.003;
-pub const MIN_CLUSTER_SIZE:     usize = 3;
+const ATR_PERIOD: usize = 14;
 
 const RETRACE_LEVELS: &[(f64, &str)] = &[
     (0.382, "38.2%"),
@@ -24,9 +28,6 @@ const EXPAND_LEVELS: &[(f64, &str)] = &[
     (1.000, "OP"),
     (1.618, "XOP"),
 ];
-const ATR_PERIOD:               usize = 14;
-const ATR_COMPRESSION_LOOKBACK: usize = 20;
-const ATR_COMPRESSION_RATIO:    f64   = 0.75;
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -39,48 +40,41 @@ pub struct FibLevel {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FibCluster {
-    /// Mean price of all constituent Fibonacci levels.
     pub price:          f64,
-    /// Number of distinct Fibonacci levels within the cluster.
     pub strength:       usize,
-    /// "support" when below current close; "resistance" when above.
     pub direction:      String,
-    /// Constituent levels forming this confluence zone.
     pub levels:         Vec<FibLevel>,
-    /// True when current ATR < 75% of 20-bar ATR mean (volatility squeeze).
     pub atr_compressed: bool,
-    /// Absolute % distance from current close to cluster center.
     pub distance_pct:   f64,
 }
 
-// ── Internal pivot ────────────────────────────────────────────────────────────
+// ── Internal pivot (pub(crate) for future harmonics.rs) ───────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
-enum PivotKind { High, Low }
+pub(crate) enum PivotKind { High, Low }
 
-struct Pivot {
-    ts:    String,
-    price: f64,
-    kind:  PivotKind,
+pub(crate) struct Pivot {
+    pub ts:    String,
+    pub price: f64,
+    pub kind:  PivotKind,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn compute_fib_confluence(raw: &[OhlcvCandle]) -> Vec<FibCluster> {
+pub fn compute_fib_confluence(raw: &[OhlcvCandle], profile: &FibProfile) -> Vec<FibCluster> {
     if raw.len() < 5 { return vec![]; }
 
     let current_close  = raw.last().unwrap().close;
-    let atr_compressed = is_atr_compressed(raw);
+    let atr_compressed = is_atr_compressed(raw, profile);
     let pivots         = detect_pivots(raw);
     if pivots.len() < 2 { return vec![]; }
 
     let mut all_levels: Vec<FibLevel> = Vec::new();
 
-    // Retracements from each consecutive pivot leg A→B
     for w in pivots.windows(2) {
         let a  = &w[0];
         let b  = &w[1];
-        let ab = b.price - a.price; // signed: positive when B > A
+        let ab = b.price - a.price;
         for &(r, label) in RETRACE_LEVELS {
             let price = b.price - ab * r;
             all_levels.push(FibLevel {
@@ -91,12 +85,11 @@ pub fn compute_fib_confluence(raw: &[OhlcvCandle]) -> Vec<FibCluster> {
         }
     }
 
-    // DiNapoli expansions from ABC: A→B is the primary leg, C is the retrace end
     for w in pivots.windows(3) {
         let a = &w[0];
         let b = &w[1];
         let c = &w[2];
-        if b.kind == a.kind { continue; } // must alternate High/Low
+        if b.kind == a.kind { continue; }
         let ab  = (b.price - a.price).abs();
         let dir = if b.price > a.price { 1.0_f64 } else { -1.0_f64 };
         for &(ratio, name) in EXPAND_LEVELS {
@@ -109,12 +102,12 @@ pub fn compute_fib_confluence(raw: &[OhlcvCandle]) -> Vec<FibCluster> {
         }
     }
 
-    cluster_levels(all_levels, current_close, atr_compressed)
+    cluster_levels(all_levels, current_close, atr_compressed, profile)
 }
 
-// ── Pivot detection ───────────────────────────────────────────────────────────
+// ── Pivot detection (pub(crate) — shared with harmonics once implemented) ─────
 
-fn detect_pivots(raw: &[OhlcvCandle]) -> Vec<Pivot> {
+pub(crate) fn detect_pivots(raw: &[OhlcvCandle]) -> Vec<Pivot> {
     let mut raw_pivots: Vec<Pivot> = Vec::new();
     for i in 1..raw.len().saturating_sub(1) {
         let prev = &raw[i - 1];
@@ -129,8 +122,7 @@ fn detect_pivots(raw: &[OhlcvCandle]) -> Vec<Pivot> {
     deduplicate_pivots(raw_pivots)
 }
 
-/// Collapse consecutive same-kind pivots, keeping the most extreme price.
-fn deduplicate_pivots(pivots: Vec<Pivot>) -> Vec<Pivot> {
+pub(crate) fn deduplicate_pivots(pivots: Vec<Pivot>) -> Vec<Pivot> {
     let mut result: Vec<Pivot> = Vec::new();
     for p in pivots {
         let merged = if let Some(last) = result.last_mut() {
@@ -160,6 +152,7 @@ fn cluster_levels(
     mut levels:     Vec<FibLevel>,
     current_close:  f64,
     atr_compressed: bool,
+    profile:        &FibProfile,
 ) -> Vec<FibCluster> {
     levels.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -167,15 +160,14 @@ fn cluster_levels(
     let mut i = 0;
     while i < levels.len() {
         let base = levels[i].price;
-        let tol  = base * CLUSTER_TOLERANCE;
-        // partition_point: count of elements in levels[i..] within tol of base
+        let tol  = base * profile.cluster_tolerance;
         let end  = levels[i..].partition_point(|l| (l.price - base).abs() <= tol);
-        let n    = end.max(1); // end >= 1 always (levels[i] itself satisfies abs=0)
+        let n    = end.max(1);
         let group: Vec<FibLevel> = levels[i..i + n].to_vec();
         let center = group.iter().map(|l| l.price).sum::<f64>() / group.len() as f64;
         let dist   = ((center - current_close) / current_close).abs() * 100.0;
         let dir    = if center <= current_close { "support" } else { "resistance" };
-        if group.len() >= MIN_CLUSTER_SIZE {
+        if group.len() >= profile.min_cluster_size {
             clusters.push(FibCluster {
                 price:          round5(center),
                 strength:       group.len(),
@@ -194,13 +186,13 @@ fn cluster_levels(
 
 // ── ATR compression ───────────────────────────────────────────────────────────
 
-fn is_atr_compressed(raw: &[OhlcvCandle]) -> bool {
+fn is_atr_compressed(raw: &[OhlcvCandle], profile: &FibProfile) -> bool {
     let atr_pts = compute_atr(raw, ATR_PERIOD);
-    if atr_pts.len() < ATR_COMPRESSION_LOOKBACK { return false; }
-    let recent   = &atr_pts[atr_pts.len() - ATR_COMPRESSION_LOOKBACK..];
+    if atr_pts.len() < profile.atr_compression_lookback { return false; }
+    let recent   = &atr_pts[atr_pts.len() - profile.atr_compression_lookback..];
     let mean_atr = recent.iter().map(|p| p.atr).sum::<f64>() / recent.len() as f64;
-    let current  = atr_pts.last().unwrap().atr;
-    current < mean_atr * ATR_COMPRESSION_RATIO
+    let current  = recent.last().map(|p| p.atr).unwrap_or(0.0);
+    current < mean_atr * profile.atr_compression_ratio
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -223,13 +215,18 @@ mod tests {
     #[test]
     fn returns_empty_when_too_few_candles() {
         let raw = vec![c("0", 1.0, 1.1, 0.9, 1.0)];
-        assert!(compute_fib_confluence(&raw).is_empty());
+        assert!(compute_fib_confluence(&raw, &FibProfile::mature()).is_empty());
     }
 
     #[test]
     fn does_not_panic_on_flat_market() {
         let raw: Vec<_> = (0..30).map(|i| c(&i.to_string(), 1.0, 1.0, 1.0, 1.0)).collect();
-        let _ = compute_fib_confluence(&raw);
+        let _ = compute_fib_confluence(&raw, &FibProfile::mature());
+    }
+
+    #[test]
+    fn nascent_wider_tolerance_than_mature() {
+        assert!(FibProfile::nascent().cluster_tolerance > FibProfile::mature().cluster_tolerance);
     }
 
     #[test]
@@ -246,7 +243,14 @@ mod tests {
     }
 
     #[test]
-    fn cluster_tolerance_is_0_3_pct() {
-        assert!((CLUSTER_TOLERANCE - 0.003).abs() < 1e-9);
+    fn deduplication_keeps_lowest_low() {
+        let pivots = vec![
+            Pivot { ts: "a".into(), price: 1.0, kind: PivotKind::Low },
+            Pivot { ts: "b".into(), price: 0.5, kind: PivotKind::Low },
+            Pivot { ts: "c".into(), price: 2.0, kind: PivotKind::High },
+        ];
+        let deduped = deduplicate_pivots(pivots);
+        assert_eq!(deduped.len(), 2);
+        assert!((deduped[0].price - 0.5).abs() < 1e-9);
     }
 }
