@@ -1,6 +1,7 @@
 pub mod fib_confluence;
 pub mod fib_profile;
 pub mod fib_targets;
+pub mod fib_time_zones;
 pub mod fvg;
 pub mod harmonics;
 pub mod liquidity;

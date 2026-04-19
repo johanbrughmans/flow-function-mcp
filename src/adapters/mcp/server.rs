@@ -1,8 +1,8 @@
 /// FlowFunctionServer — MCP inbound adapter (Function Layer, TGF Layer 3).
 ///
-/// 19 QUERY tools (read-only):
+/// 20 QUERY tools (read-only):
 ///   OHLCV indicators : rsi, ma_cross, atr, bollinger, donchian, volatility
-///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence, fib_targets, harmonic_patterns
+///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence, fib_targets, harmonic_patterns, fib_time_zones
 ///   Price action+flow: ha_pattern, order_flow
 ///   Non-OHLCV        : governance_signal, orderbook_pressure, staking_flow, wallet_flow
 ///
@@ -49,6 +49,7 @@ use crate::{
             fib_confluence::compute_fib_confluence,
             fib_profile::FibProfile,
             fib_targets::compute_fib_targets,
+            fib_time_zones::compute_fib_time_zones,
             fvg::compute_fvg,
             harmonics::compute_harmonic_patterns,
             liquidity::compute_liquidity,
@@ -204,6 +205,22 @@ struct HarmonicPatternsInput {
     #[serde(default = "default_fib_last_n")]
     last_n:  u32,
     #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(flatten)]
+    source:  CandleSource,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FibTimeZonesInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
+    pair:    String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    tf:      String,
+    #[schemars(description = "Candles to scan (default 200, min 50)")]
+    #[serde(default = "default_fib_last_n")]
+    last_n:  u32,
+    #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" (mature not supported — returns error)")]
     #[serde(default)]
     profile: Option<String>,
     #[serde(flatten)]
@@ -557,6 +574,31 @@ impl FlowFunctionServer {
         serde_json::to_string(&found).map_err(|e| e.to_string())
     }
 
+    // ── Fibonacci Time Zones ───────────────────────────────────────────────────
+
+    #[tool(
+        name = "fib_time_zones",
+        description = "Fibonacci Time Zones — temporal projection from the highest-volatility impulse candle (ADR-002). \
+                       Anchor: candle with highest (high−low)/ATR₁₄ ratio in the window. \
+                       Projects Fibonacci sequence [1,1,2,3,5,8,13,21,34,55] bars forward from anchor. \
+                       Returns {anchor_ts, anchor_ratio, profile, exploratory, zones}. \
+                       zones: [{fib_n, ts, in_window}] — ts=null and in_window=false for future bars. \
+                       Profile gate: \"mature\" not supported — returns error. \
+                       \"developing\" (max_bars=55) | \"nascent\" (max_bars=34, exploratory=true). \
+                       candle_source: \"ohlcv\"(default) | \"ha\". \
+                       Default last_n=200. QUERY — read-only."
+    )]
+    async fn fib_time_zones(&self, Parameters(req): Parameters<FibTimeZonesInput>) -> Result<String, String> {
+        let pair    = parse_pair(&req.pair)?;
+        let tf      = parse_tf(&req.tf)?;
+        let profile = parse_profile(req.profile)?;
+        let n       = req.last_n.max(50);
+        let raw     = self.fetch_ohlcv(&pair, tf, n, 50).await?;
+        let raw     = apply_candle_source(raw, &req.source.candle_source)?;
+        let result  = compute_fib_time_zones(&raw, &profile)?;
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
     // ── HA Pattern ─────────────────────────────────────────────────────────────
 
     #[tool(
@@ -717,7 +759,7 @@ impl ServerHandler for FlowFunctionServer {
                fvg {pair,tf,last_n,candle_source?} | order_blocks {pair,tf,last_n,candle_source?} | \
                structure {pair,tf,last_n,candle_source?} | liquidity {pair,tf,last_n,candle_source?} | \
                fib_confluence {pair,tf,last_n?,profile?,candle_source?} | fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
-               harmonic_patterns {pair,tf,last_n?,profile?,candle_source?}\n\
+               harmonic_patterns {pair,tf,last_n?,profile?,candle_source?} | fib_time_zones {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\
                ha_pattern {pair,tf,last_n} | order_flow {pair,tf,last_n}\n\
              Non-OHLCV (from OMV SQLite):\n\
