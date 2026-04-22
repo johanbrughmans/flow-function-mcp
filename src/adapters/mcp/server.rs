@@ -46,13 +46,13 @@ use crate::{
         },
         pair::Pair,
         smc::{
-            fib_confluence::compute_fib_confluence,
             fib_profile::FibProfile,
             fib_targets::compute_fib_targets,
             fib_time_zones::compute_fib_time_zones,
             fvg::compute_fvg,
             harmonics::compute_harmonic_patterns,
             liquidity::compute_liquidity,
+            multi_anchor_fib::compute_multi_anchor_fib,
             order_blocks::compute_order_blocks,
             structure::compute_structure,
         },
@@ -164,17 +164,20 @@ struct SmcSourceInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FibConfluenceInput {
     #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
-    pair:    String,
+    pair:      String,
     #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
-    tf:      String,
-    #[schemars(description = "Candles to scan for swing pivots (default 200, min 50)")]
+    tf:        String,
+    #[schemars(description = "Candles to scan (default 200, min 50). Defines the P3 session range.")]
     #[serde(default = "default_fib_last_n")]
-    last_n:  u32,
-    #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
+    last_n:    u32,
+    #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\"). Controls ATR tolerance multiplier.")]
     #[serde(default)]
-    profile: Option<String>,
+    profile:   Option<String>,
+    #[schemars(description = "Minimum anchor score to include a zone (1–5, default 2). A score of 2 means at least 2 reference frames agree.")]
+    #[serde(default)]
+    min_score: Option<u8>,
     #[serde(flatten)]
-    source:  CandleSource,
+    source:    CandleSource,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -498,25 +501,40 @@ impl FlowFunctionServer {
 
     #[tool(
         name = "fib_confluence",
-        description = "DiNapoli Fibonacci Confluence zones from PCTS OHLCV. \
-                       Detects swing pivots (3-bar high/low), then computes: \
-                       Retracements 38.2/50.0/61.8% from each A→B leg (DiNapoli primary set); \
-                       Expansions COP=61.8%, OP=100%, XOP=161.8% from ABC patterns (DiNapoli 1998). \
-                       Clusters levels within tolerance (profile-controlled). \
-                       Returns [{price, strength, direction, levels, atr_compressed, distance_pct}] nearest-first. \
-                       direction: \"support\" (below close) | \"resistance\" (above close). \
-                       profile: \"nascent\" (0.8% tol, min 2) | \"developing\" (0.5%, min 2) | \"mature\" (0.3%, min 3, default). \
-                       candle_source: \"ohlcv\"(default) | \"ha\". Default last_n=200 candles. QUERY — read-only."
+        description = "Multi-anchor Fibonacci Confluence — scores fib levels across 5 independent reference frames (Story #37). \
+                       P1: current structure range (last opposing BOS/CHoCH from market structure detection). \
+                       P2: swing pivot range (last swing high + last swing low). \
+                       P3: session range (highest high / lowest low of the candle window). \
+                       P4: previous day high/low (auto-fetched at 1d). \
+                       P5: previous week high/low (auto-fetched at 1w). \
+                       score = count of anchors whose fib level falls within ATR tolerance. Max = 5. \
+                       Returns {pair, tf, zones, p1_source, computed_at}. \
+                       zones: [{ratio, direction, level, zone_low, zone_high, score, anchors}] nearest-first. \
+                       direction: \"up\" (retracement from low) | \"down\" (retracement from high). \
+                       p1_source: \"structure\" | \"fallback_Nw\" (N weeks used when no BOS/CHoCH found). \
+                       profile controls ATR tolerance multiplier: \"mature\"=0.20×ATR | \"developing\"=0.25×ATR | \"nascent\"=0.35×ATR. \
+                       min_score: minimum anchor count to include zone (default 2). \
+                       candle_source: \"ohlcv\"(default) | \"ha\". Default last_n=200. QUERY — read-only."
     )]
     async fn fib_confluence(&self, Parameters(req): Parameters<FibConfluenceInput>) -> Result<String, String> {
-        let pair    = parse_pair(&req.pair)?;
-        let tf      = parse_tf(&req.tf)?;
-        let profile = parse_profile(req.profile)?;
-        let n       = req.last_n.max(50);
-        let raw     = self.fetch_ohlcv(&pair, tf, n, 50).await?;
-        let raw     = apply_candle_source(raw, &req.source.candle_source)?;
-        let zones   = compute_fib_confluence(&raw, &profile);
-        serde_json::to_string(&zones).map_err(|e| e.to_string())
+        let pair     = parse_pair(&req.pair)?;
+        let tf       = parse_tf(&req.tf)?;
+        let tf_str   = tf.label().to_string();
+        let profile  = parse_profile(req.profile)?;
+        let n        = req.last_n.max(50);
+        let min_sc   = req.min_score.unwrap_or(2).clamp(1, 5);
+
+        let raw = self.fetch_ohlcv(&pair, tf, n, 50).await?;
+        let raw = apply_candle_source(raw, &req.source.candle_source)?;
+
+        let (pdh, pdl) = self.fetch_prev_level(&pair, "1d").await;
+        let (pwh, pwl) = self.fetch_prev_level(&pair, "1w").await;
+
+        let result = compute_multi_anchor_fib(
+            &raw, pdh, pdl, pwh, pwl,
+            &profile, min_sc, 6, &tf_str, &req.pair,
+        );
+        serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
     // ── Fibonacci Targets ──────────────────────────────────────────────────────
@@ -724,7 +742,7 @@ impl FlowFunctionServer {
     }
 }
 
-// ── OHLCV fetch helper (with seed) ────────────────────────────────────────────
+// ── OHLCV fetch helpers ───────────────────────────────────────────────────────
 
 impl FlowFunctionServer {
     async fn fetch_ohlcv(
@@ -736,6 +754,23 @@ impl FlowFunctionServer {
     ) -> Result<Vec<crate::domain::candle::OhlcvCandle>, String> {
         let window = Window::LastN(last_n.saturating_add(seed));
         self.adapter.ohlcv(pair, tf, &window).await.map_err(|e| e.to_string())
+    }
+
+    /// Fetch previous completed period high/low for a given timeframe.
+    /// Fetches 3 candles and returns (high, low) of the second-to-last (index len-2).
+    /// Returns (None, None) on error or insufficient data.
+    async fn fetch_prev_level(&self, pair: &Pair, tf_str: &str) -> (Option<f64>, Option<f64>) {
+        let tf = match tf_str.parse::<Timeframe>() {
+            Ok(t) => t,
+            Err(_) => return (None, None),
+        };
+        match self.fetch_ohlcv(pair, tf, 3, 0).await {
+            Ok(candles) if candles.len() >= 2 => {
+                let prev = &candles[candles.len() - 2];
+                (Some(prev.high), Some(prev.low))
+            }
+            _ => (None, None),
+        }
     }
 }
 
@@ -758,7 +793,7 @@ impl ServerHandler for FlowFunctionServer {
              SMC (from PCTS SQL Server):\n\
                fvg {pair,tf,last_n,candle_source?} | order_blocks {pair,tf,last_n,candle_source?} | \
                structure {pair,tf,last_n,candle_source?} | liquidity {pair,tf,last_n,candle_source?} | \
-               fib_confluence {pair,tf,last_n?,profile?,candle_source?} | fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
+               fib_confluence {pair,tf,last_n?,profile?,min_score?,candle_source?} | fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
                harmonic_patterns {pair,tf,last_n?,profile?,candle_source?} | fib_time_zones {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\
                ha_pattern {pair,tf,last_n} | order_flow {pair,tf,last_n}\n\

@@ -5,6 +5,7 @@ pub mod fib_time_zones;
 pub mod fvg;
 pub mod harmonics;
 pub mod liquidity;
+pub mod multi_anchor_fib;
 pub mod order_blocks;
 pub mod pivots;
 pub mod structure;
