@@ -6,6 +6,8 @@
 ///
 /// Current modules:
 ///   - multi_anchor_fib_backtest: validates score-bucket calibration for
-///     multi-anchor Fibonacci confluence (Story #39).
+///     multi-anchor Fibonacci confluence (Stories #39 + #43).
+///   - structure_backtest: validates BOS/CHoCH follow-through (Story #40).
 
 pub mod multi_anchor_fib_backtest;
+pub mod structure_backtest;

@@ -29,6 +29,7 @@ use crate::{
     adapters::composite::CompositeAdapter,
     domain::{
         backtest::multi_anchor_fib_backtest::backtest_multi_anchor_fib,
+        backtest::structure_backtest::backtest_structure,
         flow::compute_order_flow,
         ha::{compute_ha_patterns, SEED_LOOKBACK},
         indicators::{
@@ -204,6 +205,28 @@ struct FibConfluenceBacktestInput {
     min_score:      Option<u8>,
     #[serde(flatten)]
     source:         CandleSource,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StructureBacktestInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
+    pair:             String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    tf:               String,
+    #[schemars(description = "Total candle history to walk-forward over (default 1000)")]
+    #[serde(default = "default_backtest_last_n")]
+    last_n:           u32,
+    #[schemars(description = "Minimum history before an event is validated (default 200)")]
+    #[serde(default = "default_backtest_window")]
+    window_size:      u32,
+    #[schemars(description = "Forward validation window in candles (default 10)")]
+    #[serde(default = "default_backtest_lookahead")]
+    lookahead_bars:   u32,
+    #[schemars(description = "Follow-through significance threshold as fraction of break level (default 0.005 = 0.5%)")]
+    #[serde(default)]
+    follow_threshold: Option<f64>,
+    #[serde(flatten)]
+    source:           CandleSource,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -605,6 +628,43 @@ impl FlowFunctionServer {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    // ── Structure Backtest (ADR-017, Story #40) ────────────────────────────────
+
+    #[tool(
+        name = "structure_backtest",
+        description = "Indicator-level walk-forward backtest of market structure events (ADR-017, Story #40). \
+                       Tests the claim: \"a BOS signals trend continuation; within lookahead_bars price makes a \
+                       higher high (bullish) or lower low (bearish) beyond the break level by ≥ follow_threshold\". \
+                       CHoCH events tested with the same directional expectation (reversal leg). \
+                       Returns {pair, tf, total_events, buckets, *_better_than_random, ...}. \
+                       buckets: [{event_type, direction, n_events, n_followed, follow_rate, avg_bars_to_follow, \
+                       avg_follow_magnitude_pct}] per (event_type × direction) — 4 combinations total. \
+                       Gates: bos_bullish / bos_bearish / choch_bullish / choch_bearish _better_than_random = \
+                       (n_events ≥ 30 AND follow_rate ≥ 0.55). \
+                       Causal-safe: compute_structure emits events at their natural timestamp; full-history \
+                       computation is equivalent to per-candle walk-forward for the purposes of event detection. \
+                       Events with insufficient history (idx < window_size) or future (idx + lookahead ≥ len) \
+                       are skipped. QUERY — read-only."
+    )]
+    async fn structure_backtest(&self, Parameters(req): Parameters<StructureBacktestInput>) -> Result<String, String> {
+        let pair         = parse_pair(&req.pair)?;
+        let tf           = parse_tf(&req.tf)?;
+        let tf_str       = tf.label().to_string();
+        let window_size  = req.window_size.max(50) as usize;
+        let lookahead    = req.lookahead_bars.max(1) as usize;
+        let follow_thr   = req.follow_threshold.unwrap_or(0.005).max(0.0001);
+        let min_last_n   = (window_size + lookahead + 50) as u32;
+        let last_n       = req.last_n.max(min_last_n);
+
+        let raw = self.fetch_ohlcv(&pair, tf, last_n, 0).await?;
+        let raw = apply_candle_source(raw, &req.source.candle_source)?;
+
+        let result = backtest_structure(
+            &raw, window_size, lookahead, follow_thr, &tf_str, &req.pair,
+        );
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
     // ── Fibonacci Targets ──────────────────────────────────────────────────────
 
     #[tool(
@@ -863,6 +923,7 @@ impl ServerHandler for FlowFunctionServer {
                structure {pair,tf,last_n,candle_source?} | liquidity {pair,tf,last_n,candle_source?} | \
                fib_confluence {pair,tf,last_n?,profile?,min_score?,candle_source?} | \
                fib_confluence_backtest {pair,tf,last_n?,window_size?,lookahead_bars?,profile?,min_score?,candle_source?} | \
+               structure_backtest {pair,tf,last_n?,window_size?,lookahead_bars?,follow_threshold?,candle_source?} | \
                fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
                harmonic_patterns {pair,tf,last_n?,profile?,candle_source?} | fib_time_zones {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\
