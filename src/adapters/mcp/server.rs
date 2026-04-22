@@ -29,6 +29,7 @@ use crate::{
     adapters::composite::CompositeAdapter,
     domain::{
         backtest::multi_anchor_fib_backtest::backtest_multi_anchor_fib,
+        backtest::order_blocks_backtest::backtest_order_blocks,
         backtest::order_flow_backtest::backtest_order_flow,
         backtest::structure_backtest::backtest_structure,
         flow::compute_order_flow,
@@ -204,6 +205,22 @@ struct FibConfluenceBacktestInput {
     #[schemars(description = "Minimum anchor score to include a zone (1–5, default 2)")]
     #[serde(default)]
     min_score:      Option<u8>,
+    #[serde(flatten)]
+    source:         CandleSource,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct OrderBlocksBacktestInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
+    pair:           String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    tf:             String,
+    #[schemars(description = "Total candle history to iterate over (default 1000)")]
+    #[serde(default = "default_backtest_last_n")]
+    last_n:         u32,
+    #[schemars(description = "Forward validation window in candles (default 10)")]
+    #[serde(default = "default_backtest_lookahead")]
+    lookahead_bars: u32,
     #[serde(flatten)]
     source:         CandleSource,
 }
@@ -643,6 +660,41 @@ impl FlowFunctionServer {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    // ── Order Blocks Backtest (ADR-017, Story #40) ─────────────────────────────
+
+    #[tool(
+        name = "order_blocks_backtest",
+        description = "Indicator-level retest-respect backtest of Order Blocks (ADR-017, Story #40). \
+                       Tests the claim: \"when price returns to a bullish OB within lookahead_bars, \
+                       it holds as support (no close below bottom); bearish OB holds as resistance \
+                       (no close above top)\". \
+                       Returns {pair, tf, total_blocks, buckets, bullish_better_than_random, \
+                       bearish_better_than_random, ...}. \
+                       buckets: [{direction, n_blocks, n_returned, n_respected, return_rate, \
+                       respect_rate, avg_bars_to_return}] per direction (bullish/bearish). \
+                       return_rate depends on market activity and is not a gate; the calibration \
+                       signal is respect_rate. \
+                       Gates: *_better_than_random = (n_returned ≥ 30 AND respect_rate ≥ 0.55). \
+                       Causal-safe: OB detection confirms at i+1 from candles[i] and candles[i+1]; \
+                       the existing `broken` field uses full-history look-ahead and is ignored here \
+                       — the backtest re-validates with a bounded future window starting at i+2. \
+                       QUERY — read-only."
+    )]
+    async fn order_blocks_backtest(&self, Parameters(req): Parameters<OrderBlocksBacktestInput>) -> Result<String, String> {
+        let pair       = parse_pair(&req.pair)?;
+        let tf         = parse_tf(&req.tf)?;
+        let tf_str     = tf.label().to_string();
+        let lookahead  = req.lookahead_bars.max(1) as usize;
+        let min_last_n = (lookahead + 100) as u32;
+        let last_n     = req.last_n.max(min_last_n);
+
+        let raw = self.fetch_ohlcv(&pair, tf, last_n, 0).await?;
+        let raw = apply_candle_source(raw, &req.source.candle_source)?;
+
+        let result = backtest_order_blocks(&raw, lookahead, &tf_str, &req.pair);
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
     // ── Order Flow Backtest (ADR-017, Story #40) ───────────────────────────────
 
     #[tool(
@@ -972,6 +1024,7 @@ impl ServerHandler for FlowFunctionServer {
                fib_confluence_backtest {pair,tf,last_n?,window_size?,lookahead_bars?,profile?,min_score?,candle_source?} | \
                structure_backtest {pair,tf,last_n?,window_size?,lookahead_bars?,follow_threshold?,candle_source?} | \
                order_flow_backtest {pair,tf,last_n?,lookahead_bars?} | \
+               order_blocks_backtest {pair,tf,last_n?,lookahead_bars?,candle_source?} | \
                fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
                harmonic_patterns {pair,tf,last_n?,profile?,candle_source?} | fib_time_zones {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\

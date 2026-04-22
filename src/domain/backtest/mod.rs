@@ -10,5 +10,6 @@
 ///   - structure_backtest: validates BOS/CHoCH follow-through (Story #40).
 
 pub mod multi_anchor_fib_backtest;
+pub mod order_blocks_backtest;
 pub mod order_flow_backtest;
 pub mod structure_backtest;
