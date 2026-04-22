@@ -143,40 +143,55 @@ fn validate_event(
     future:           &[OhlcvCandle],
     follow_threshold: f64,
 ) -> EventObservation {
-    let mut followed             = false;
     let mut bars_to_follow       = None;
     let mut follow_magnitude_pct = None;
 
-    match event.direction {
+    if future.is_empty() || event.level <= 0.0 {
+        return EventObservation {
+            event_type:           event.event_type,
+            direction:            event.direction,
+            followed:             false,
+            bars_to_follow,
+            follow_magnitude_pct,
+        };
+    }
+
+    let end_close = future.last().unwrap().close;
+
+    let followed = match event.direction {
         Direction::Bullish => {
             let target = event.level * (1.0 + follow_threshold);
+
             for (i, c) in future.iter().enumerate() {
                 if c.high >= target {
-                    followed = true;
                     bars_to_follow = Some(i + 1);
                     break;
                 }
             }
             let max_high = future.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max);
-            if max_high > event.level && event.level > 0.0 {
+            if max_high > event.level {
                 follow_magnitude_pct = Some((max_high - event.level) / event.level * 100.0);
             }
+
+            end_close >= target
         }
         Direction::Bearish => {
             let target = event.level * (1.0 - follow_threshold);
+
             for (i, c) in future.iter().enumerate() {
                 if c.low <= target {
-                    followed = true;
                     bars_to_follow = Some(i + 1);
                     break;
                 }
             }
             let min_low = future.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
-            if min_low < event.level && event.level > 0.0 {
+            if min_low < event.level {
                 follow_magnitude_pct = Some((event.level - min_low) / event.level * 100.0);
             }
+
+            end_close <= target
         }
-    }
+    };
 
     EventObservation {
         event_type:           event.event_type,
@@ -296,6 +311,24 @@ mod tests {
         assert!(obs.followed);
         assert_eq!(obs.bars_to_follow, Some(2));
         assert!(obs.follow_magnitude_pct.unwrap() > 2.0);
+    }
+
+    #[test]
+    fn bullish_false_break_that_reverses_is_not_followed() {
+        let event = StructureEvent {
+            ts: "10".to_string(),
+            event_type: StructureType::Bos,
+            level: 100.0,
+            direction: Direction::Bullish,
+        };
+        let future = vec![
+            c("11", 100.0, 102.0, 99.8, 101.5),    // spikes up past 100.5
+            c("12", 101.5, 101.7, 99.0, 99.5),     // reverses
+            c("13", 99.5, 99.8, 97.5, 98.0),       // below level — break failed
+        ];
+        let obs = validate_event(&event, &future, 0.005);
+        assert_eq!(obs.bars_to_follow, Some(1));
+        assert!(!obs.followed);
     }
 
     #[test]
