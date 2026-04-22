@@ -1,3 +1,4 @@
+pub mod backtest;
 pub mod candle;
 pub mod flow;
 pub mod ha;

@@ -28,6 +28,7 @@ use crate::{
     adapters::mcp::candle_source::{apply_candle_source, CandleSource},
     adapters::composite::CompositeAdapter,
     domain::{
+        backtest::multi_anchor_fib_backtest::backtest_multi_anchor_fib,
         flow::compute_order_flow,
         ha::{compute_ha_patterns, SEED_LOOKBACK},
         indicators::{
@@ -181,6 +182,31 @@ struct FibConfluenceInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct FibConfluenceBacktestInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
+    pair:           String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    tf:             String,
+    #[schemars(description = "Total candle history to walk-forward over (default 1000, min window_size + lookahead + 50)")]
+    #[serde(default = "default_backtest_last_n")]
+    last_n:         u32,
+    #[schemars(description = "Per-zone computation window in candles (default 200, min 50)")]
+    #[serde(default = "default_backtest_window")]
+    window_size:    u32,
+    #[schemars(description = "Forward validation window in candles (default 20, min 1)")]
+    #[serde(default = "default_backtest_lookahead")]
+    lookahead_bars: u32,
+    #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
+    #[serde(default)]
+    profile:        Option<String>,
+    #[schemars(description = "Minimum anchor score to include a zone (1–5, default 2)")]
+    #[serde(default)]
+    min_score:      Option<u8>,
+    #[serde(flatten)]
+    source:         CandleSource,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct FibTargetsInput {
     #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
     pair:        String,
@@ -265,8 +291,11 @@ struct WalletFlowInput {
     last_n: Option<u32>,
 }
 
-fn default_last_n()     -> u32 { 60 }
-fn default_fib_last_n() -> u32 { 200 }
+fn default_last_n()              -> u32 { 60 }
+fn default_fib_last_n()          -> u32 { 200 }
+fn default_backtest_last_n()     -> u32 { 1000 }
+fn default_backtest_window()     -> u32 { 200 }
+fn default_backtest_lookahead()  -> u32 { 20 }
 
 // ── Parse helpers ──────────────────────────────────────────────────────────────
 
@@ -537,6 +566,44 @@ impl FlowFunctionServer {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    // ── Fibonacci Confluence Backtest (ADR-017, Story #39) ─────────────────────
+
+    #[tool(
+        name = "fib_confluence_backtest",
+        description = "Indicator-level walk-forward backtest of multi-anchor Fibonacci confluence (ADR-017). \
+                       For each historical candle t, computes zones using only history available at t, \
+                       then validates against future candles [t+1..t+lookahead_bars]. No look-ahead bias. \
+                       Returns {pair, tf, total_zones, buckets, monotonic_respect, ...}. \
+                       buckets: [{score, direction, n_zones, n_touched, n_respected, touch_rate, respect_rate, \
+                       avg_bars_to_touch, avg_penetration_pct}] per (score × direction) combination. \
+                       KEY METRIC — monotonic_respect: true if respect_rate increases with score (calibrated scoring). \
+                       If false, the scoring model is broken and must not drive a strategy. \
+                       Validation rules: \
+                       touched = any future candle [low,high] intersects [zone_low, zone_high]; \
+                       respected = after first touch, price did NOT close beyond the zone by >0.5%. \
+                       P4/P5 approximation: previous-day/previous-week H/L derived from chart candles per TF \
+                       (1h→24/168 bars, 4h→6/42, 1d→1/7). QUERY — read-only."
+    )]
+    async fn fib_confluence_backtest(&self, Parameters(req): Parameters<FibConfluenceBacktestInput>) -> Result<String, String> {
+        let pair        = parse_pair(&req.pair)?;
+        let tf          = parse_tf(&req.tf)?;
+        let tf_str      = tf.label().to_string();
+        let profile     = parse_profile(req.profile)?;
+        let min_sc      = req.min_score.unwrap_or(2).clamp(1, 5);
+        let window_size = req.window_size.max(50) as usize;
+        let lookahead   = req.lookahead_bars.max(1) as usize;
+        let min_last_n  = (window_size + lookahead + 50) as u32;
+        let last_n      = req.last_n.max(min_last_n);
+
+        let raw = self.fetch_ohlcv(&pair, tf, last_n, 0).await?;
+        let raw = apply_candle_source(raw, &req.source.candle_source)?;
+
+        let result = backtest_multi_anchor_fib(
+            &raw, &profile, min_sc, window_size, lookahead, 6, &tf_str, &req.pair,
+        );
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
     // ── Fibonacci Targets ──────────────────────────────────────────────────────
 
     #[tool(
@@ -793,7 +860,9 @@ impl ServerHandler for FlowFunctionServer {
              SMC (from PCTS SQL Server):\n\
                fvg {pair,tf,last_n,candle_source?} | order_blocks {pair,tf,last_n,candle_source?} | \
                structure {pair,tf,last_n,candle_source?} | liquidity {pair,tf,last_n,candle_source?} | \
-               fib_confluence {pair,tf,last_n?,profile?,min_score?,candle_source?} | fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
+               fib_confluence {pair,tf,last_n?,profile?,min_score?,candle_source?} | \
+               fib_confluence_backtest {pair,tf,last_n?,window_size?,lookahead_bars?,profile?,min_score?,candle_source?} | \
+               fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
                harmonic_patterns {pair,tf,last_n?,profile?,candle_source?} | fib_time_zones {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\
                ha_pattern {pair,tf,last_n} | order_flow {pair,tf,last_n}\n\
