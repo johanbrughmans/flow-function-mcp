@@ -295,7 +295,7 @@ fn default_last_n()              -> u32 { 60 }
 fn default_fib_last_n()          -> u32 { 200 }
 fn default_backtest_last_n()     -> u32 { 1000 }
 fn default_backtest_window()     -> u32 { 200 }
-fn default_backtest_lookahead()  -> u32 { 20 }
+fn default_backtest_lookahead()  -> u32 { 10 }
 
 // ── Parse helpers ──────────────────────────────────────────────────────────────
 
@@ -570,19 +570,20 @@ impl FlowFunctionServer {
 
     #[tool(
         name = "fib_confluence_backtest",
-        description = "Indicator-level walk-forward backtest of multi-anchor Fibonacci confluence (ADR-017). \
-                       For each historical candle t, computes zones using only history available at t, \
-                       then validates against future candles [t+1..t+lookahead_bars]. No look-ahead bias. \
-                       Returns {pair, tf, total_zones, buckets, monotonic_respect, ...}. \
-                       buckets: [{score, direction, n_zones, n_touched, n_respected, touch_rate, respect_rate, \
-                       avg_bars_to_touch, avg_penetration_pct}] per (score × direction) combination. \
-                       KEY METRIC — monotonic_respect: true if respect_rate increases with score (calibrated scoring). \
-                       If false, the scoring model is broken and must not drive a strategy. \
-                       Validation rules: \
-                       touched = any future candle [low,high] intersects [zone_low, zone_high]; \
-                       respected = after first touch, price did NOT close beyond the zone by >0.5%. \
+        description = "Indicator-level walk-forward backtest of multi-anchor Fibonacci confluence (ADR-017, Stories #39 + #43). \
+                       Three validation tracks in a single walk-forward pass: \
+                       LEGACY (v1 audit): naive respect = price did not close beyond zone. Regime-sensitive; kept for regression. \
+                       TRACK A — author-faithful reaction: does high score correlate with measurable post-touch reaction \
+                       (ATR spike, volume spike, wick prominence)? Gate: monotonic_reaction. \
+                       TRACK B — contextual respect: respect_rate per (score × arrival_direction × trend_regime) bucket. \
+                       arrival: \"from_above\" | \"from_below\" (where price was at observation time relative to zone). \
+                       trend: \"bullish\" | \"bearish\" | \"neutral\" (last BOS/CHoCH direction at t). \
+                       Gate: any_calibrated_bucket (does any quadrant show monotonic respect with n ≥ 30). \
+                       Returns {pair, tf, total_zones, legacy_respect, track_a_reaction, track_b_contextual, \
+                       legacy_monotonic_respect, monotonic_reaction, any_calibrated_bucket, ...}. \
+                       Statistical floor: n ≥ 30 per bucket for monotonicity checks. \
                        P4/P5 approximation: previous-day/previous-week H/L derived from chart candles per TF \
-                       (1h→24/168 bars, 4h→6/42, 1d→1/7). QUERY — read-only."
+                       (1h→24/168 bars, 4h→6/42, 1d→1/7). Default lookahead tightened to 10 bars. QUERY — read-only."
     )]
     async fn fib_confluence_backtest(&self, Parameters(req): Parameters<FibConfluenceBacktestInput>) -> Result<String, String> {
         let pair        = parse_pair(&req.pair)?;
