@@ -29,6 +29,7 @@ use crate::{
     adapters::composite::CompositeAdapter,
     domain::{
         backtest::multi_anchor_fib_backtest::backtest_multi_anchor_fib,
+        backtest::order_flow_backtest::backtest_order_flow,
         backtest::structure_backtest::backtest_structure,
         flow::compute_order_flow,
         ha::{compute_ha_patterns, SEED_LOOKBACK},
@@ -205,6 +206,20 @@ struct FibConfluenceBacktestInput {
     min_score:      Option<u8>,
     #[serde(flatten)]
     source:         CandleSource,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct OrderFlowBacktestInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
+    pair:           String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    tf:             String,
+    #[schemars(description = "Total candle history to iterate over (default 1000)")]
+    #[serde(default = "default_backtest_last_n")]
+    last_n:         u32,
+    #[schemars(description = "Forward-return horizon in candles (default 10)")]
+    #[serde(default = "default_backtest_lookahead")]
+    lookahead_bars: u32,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -628,6 +643,38 @@ impl FlowFunctionServer {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    // ── Order Flow Backtest (ADR-017, Story #40) ───────────────────────────────
+
+    #[tool(
+        name = "order_flow_backtest",
+        description = "Indicator-level forward-return backtest of order-flow net_aggression (ADR-017, Story #40). \
+                       Tests the claim: \"net_aggression = (MB-MS)/(MB+MS) at candle t predicts direction of \
+                       price movement over the next lookahead_bars candles\". \
+                       Buckets net_aggression into 5 fixed ranges: strong_bearish (≤-0.3), mild_bearish (-0.3..-0.1], \
+                       neutral (-0.1..0.1], mild_bullish (0.1..0.3], strong_bullish (>0.3). \
+                       Returns {pair, tf, total_observations, buckets, monotonic_forward_return, ...}. \
+                       buckets: [{bucket, n_events, avg_forward_return_pct, median_forward_return_pct, \
+                       positive_return_rate}] one per range. \
+                       Gate: monotonic_forward_return = true iff avg_forward_return_pct is monotonically \
+                       non-decreasing from strong_bearish → strong_bullish AND every populated bucket has n ≥ 30. \
+                       Candles without trade-flow data (mb_vol/ms_vol None) are skipped. \
+                       Causal-safe: classification uses only candle[t]; future window used only for return. \
+                       QUERY — read-only."
+    )]
+    async fn order_flow_backtest(&self, Parameters(req): Parameters<OrderFlowBacktestInput>) -> Result<String, String> {
+        let pair       = parse_pair(&req.pair)?;
+        let tf         = parse_tf(&req.tf)?;
+        let tf_str     = tf.label().to_string();
+        let lookahead  = req.lookahead_bars.max(1) as usize;
+        let min_last_n = (lookahead + 100) as u32;
+        let last_n     = req.last_n.max(min_last_n);
+
+        let raw = self.fetch_ohlcv(&pair, tf, last_n, 0).await?;
+
+        let result = backtest_order_flow(&raw, lookahead, &tf_str, &req.pair);
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
     // ── Structure Backtest (ADR-017, Story #40) ────────────────────────────────
 
     #[tool(
@@ -924,6 +971,7 @@ impl ServerHandler for FlowFunctionServer {
                fib_confluence {pair,tf,last_n?,profile?,min_score?,candle_source?} | \
                fib_confluence_backtest {pair,tf,last_n?,window_size?,lookahead_bars?,profile?,min_score?,candle_source?} | \
                structure_backtest {pair,tf,last_n?,window_size?,lookahead_bars?,follow_threshold?,candle_source?} | \
+               order_flow_backtest {pair,tf,last_n?,lookahead_bars?} | \
                fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
                harmonic_patterns {pair,tf,last_n?,profile?,candle_source?} | fib_time_zones {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\
