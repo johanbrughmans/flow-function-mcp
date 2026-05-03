@@ -1,6 +1,6 @@
 /// FlowFunctionServer — MCP inbound adapter (Function Layer, TGF Layer 3).
 ///
-/// 22 QUERY tools (read-only):
+/// 28 QUERY tools (read-only):
 ///   OHLCV indicators : rsi, ma_cross, atr, bollinger, donchian, volatility
 ///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence, fib_targets, harmonic_patterns, fib_time_zones
 ///   Price action+flow: ha_pattern, order_flow
@@ -29,6 +29,8 @@ use crate::{
     adapters::composite::CompositeAdapter,
     domain::{
         backtest::fib_targets_backtest::backtest_fib_targets,
+        backtest::fib_time_zones_backtest::backtest_fib_time_zones,
+        backtest::harmonic_patterns_backtest::backtest_harmonic_patterns,
         backtest::multi_anchor_fib_backtest::backtest_multi_anchor_fib,
         backtest::order_blocks_backtest::backtest_order_blocks,
         backtest::order_flow_backtest::backtest_order_flow,
@@ -230,6 +232,45 @@ struct FibTargetsBacktestInput {
     #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
     #[serde(default)]
     profile:        Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct HarmonicPatternsBacktestInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\", \"BTCEUR\"")]
+    pair:           String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    #[serde(default = "default_tf_1d")]
+    tf:             String,
+    #[schemars(description = "Total candle history (default 1000)")]
+    #[serde(default = "default_backtest_last_n")]
+    last_n:         u32,
+    #[schemars(description = "Per-observation lookback window (default 200, min 50)")]
+    #[serde(default = "default_backtest_window")]
+    window_size:    u32,
+    #[schemars(description = "Forward validation window in candles (default 10)")]
+    #[serde(default = "default_backtest_lookahead")]
+    lookahead_bars: u32,
+    #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
+    #[serde(default)]
+    profile:        Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FibTimeZonesBacktestInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\", \"BTCEUR\"")]
+    pair:        String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    #[serde(default = "default_tf_1d")]
+    tf:          String,
+    #[schemars(description = "Total candle history (default 1000)")]
+    #[serde(default = "default_backtest_last_n")]
+    last_n:      u32,
+    #[schemars(description = "Per-observation lookback window (default 200, min 50)")]
+    #[serde(default = "default_backtest_window")]
+    window_size: u32,
+    #[schemars(description = "Profile: \"developing\" (default) or \"nascent\". Mature is not supported.")]
+    #[serde(default)]
+    profile:     Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -848,6 +889,60 @@ impl FlowFunctionServer {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    // ── Fibonacci Time Zones Backtest (ADR-017, Story #54 / #40) ────────────
+
+    #[tool(
+        name = "fib_time_zones_backtest",
+        description = "Indicator-level temporal acceleration calibration of Fibonacci Time Zones (ADR-017, Story #54). \
+                       Tests the claim: candles falling on a projected Fib time zone boundary have higher absolute \
+                       next-bar return than non-zone candles (directional acceleration). \
+                       lookahead is always 1 bar (next-bar abs return). \
+                       Zone match: candle ts in the window's projected zone timestamps. \
+                       Profile: \"developing\" (default, max 55 bars) or \"nascent\" — mature not supported. \
+                       Returns {pair, tf, n_on_zone, n_off_zone, mean_abs_return_on_zone, mean_abs_return_off_zone, signal_present}. \
+                       QUERY — read-only."
+    )]
+    async fn fib_time_zones_backtest(&self, Parameters(req): Parameters<FibTimeZonesBacktestInput>) -> Result<String, String> {
+        let pair        = parse_pair(&req.pair)?;
+        let tf          = parse_tf(&req.tf)?;
+        let tf_str      = tf.label().to_string();
+        let window_size = (req.window_size.max(50)) as usize;
+        // default profile: developing (mature not supported by fib_time_zones)
+        let profile_str = req.profile.as_deref().unwrap_or("developing");
+        let profile     = FibProfile::parse(profile_str).map_err(|e| e.to_string())?;
+        let last_n      = req.last_n.max(window_size as u32 + 10);
+        let raw         = self.fetch_ohlcv(&pair, tf, last_n, 0).await?;
+        let result      = backtest_fib_time_zones(&raw, window_size, &profile, &tf_str, &req.pair);
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
+    // ── Harmonic Patterns Backtest (ADR-017, Story #53 / #40) ────────────────
+
+    #[tool(
+        name = "harmonic_patterns_backtest",
+        description = "Indicator-level reversal calibration of XABCD harmonic patterns (ADR-017, Story #53). \
+                       Tests the claim: completed patterns at D signal reversal; higher xabcd_quality correlates \
+                       with stronger directional follow-through. \
+                       Hit = price moves in expected direction within lookahead_bars (bullish: close>d_price, bearish: close<d_price). \
+                       Quality buckets: low (<0.4), medium (0.4–0.7), high (>0.7). \
+                       Pattern stats per Gartley/Bat/Butterfly/Crab. \
+                       Calibration gate: n≥30 per bucket (ADR-017). \
+                       Returns {pair, tf, quality_buckets, pattern_stats, monotonic, total_patterns}. \
+                       QUERY — read-only."
+    )]
+    async fn harmonic_patterns_backtest(&self, Parameters(req): Parameters<HarmonicPatternsBacktestInput>) -> Result<String, String> {
+        let pair        = parse_pair(&req.pair)?;
+        let tf          = parse_tf(&req.tf)?;
+        let tf_str      = tf.label().to_string();
+        let window_size = (req.window_size.max(50)) as usize;
+        let lookahead   = req.lookahead_bars.max(1) as usize;
+        let profile     = parse_profile(req.profile)?;
+        let last_n      = req.last_n.max(window_size as u32 + req.lookahead_bars + 10);
+        let raw         = self.fetch_ohlcv(&pair, tf, last_n, 0).await?;
+        let result      = backtest_harmonic_patterns(&raw, window_size, lookahead, &profile, &tf_str, &req.pair);
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
     // ── Fibonacci Targets ──────────────────────────────────────────────────────
 
     #[tool(
@@ -1111,6 +1206,8 @@ impl ServerHandler for FlowFunctionServer {
                order_blocks_backtest {pair,tf,last_n?,lookahead_bars?,candle_source?} | \
                orderbook_pressure_backtest {pair,last_n?} | \
                fib_targets_backtest {pair,tf?,last_n?,window_size?,lookahead_bars?,profile?} | \
+               fib_time_zones_backtest {pair,tf?,last_n?,window_size?,profile?} | \
+               harmonic_patterns_backtest {pair,tf?,last_n?,window_size?,lookahead_bars?,profile?} | \
                fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
                harmonic_patterns {pair,tf,last_n?,profile?,candle_source?} | fib_time_zones {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\

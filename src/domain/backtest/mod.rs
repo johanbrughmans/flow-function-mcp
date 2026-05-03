@@ -12,8 +12,12 @@
 ///   - order_blocks_backtest: validates OB retest-respect rate (Story #40).
 ///   - orderbook_pressure_backtest: validates OBI daily forward-return bucketing (Story #51 / #40).
 ///   - fib_targets_backtest: validates Fibonacci TP target hit rates by anchor strength (Story #52 / #40).
+///   - harmonic_patterns_backtest: validates XABCD quality-bucket calibration for reversal follow-through (Story #53 / #40).
+///   - fib_time_zones_backtest: validates temporal acceleration claim for Fibonacci Time Zones (Story #54 / #40).
 
 pub mod fib_targets_backtest;
+pub mod fib_time_zones_backtest;
+pub mod harmonic_patterns_backtest;
 pub mod multi_anchor_fib_backtest;
 pub mod order_blocks_backtest;
 pub mod order_flow_backtest;
