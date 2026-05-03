@@ -119,6 +119,24 @@ impl SqliteAdapter {
         Ok(rows)
     }
 
+    pub fn orderbook_all(&self, pair: &Pair) -> Result<Vec<OrderBookSnapshot>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare(
+            "SELECT ts, mid_price, bid1, ask1, spread_bps,
+                    bid_vol_10, ask_vol_10, bid_vol_25, ask_vol_25,
+                    bid_vol_50, ask_vol_50, bid_depth, ask_depth, depth_levels,
+                    bid_vwap_25, ask_vwap_25, bid_vwap_100, ask_vwap_100,
+                    bid_price_range_100, ask_price_range_100,
+                    effective_spread_25_bps, bid_level_count, ask_level_count
+             FROM kraken_orderbook WHERE db_symbol=? ORDER BY ts ASC",
+        )?;
+        let rows: Vec<OrderBookSnapshot> = stmt
+            .query_map([pair.as_str()], row_to_orderbook)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     // ── Cosmos ──────────────────────────────────────────────────────────────────
 
     pub fn cosmos_stake_events(&self, last_n: Option<u32>, msg_type: Option<StakeMsgType>) -> Result<Vec<CosmosStakeEvent>> {

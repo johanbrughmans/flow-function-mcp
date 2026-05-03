@@ -41,6 +41,16 @@ impl MarketDataPort for CompositeAdapter {
     }
 }
 
+impl CompositeAdapter {
+    pub async fn orderbook_all(&self, pair: &Pair) -> Result<Vec<OrderBookSnapshot>> {
+        let sqlite = self.sqlite.clone();
+        let pair   = pair.clone();
+        tokio::task::spawn_blocking(move || sqlite.orderbook_all(&pair))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking error: {e}"))?
+    }
+}
+
 #[async_trait]
 impl OnChainPort for CompositeAdapter {
     async fn governance(&self, pair: Option<&Pair>) -> Result<Vec<GovernanceSnapshot>> {

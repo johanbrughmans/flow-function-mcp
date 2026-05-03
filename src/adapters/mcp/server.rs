@@ -1,6 +1,6 @@
 /// FlowFunctionServer — MCP inbound adapter (Function Layer, TGF Layer 3).
 ///
-/// 20 QUERY tools (read-only):
+/// 21 QUERY tools (read-only):
 ///   OHLCV indicators : rsi, ma_cross, atr, bollinger, donchian, volatility
 ///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence, fib_targets, harmonic_patterns, fib_time_zones
 ///   Price action+flow: ha_pattern, order_flow
@@ -31,6 +31,7 @@ use crate::{
         backtest::multi_anchor_fib_backtest::backtest_multi_anchor_fib,
         backtest::order_blocks_backtest::backtest_order_blocks,
         backtest::order_flow_backtest::backtest_order_flow,
+        backtest::orderbook_pressure_backtest::backtest_orderbook_pressure,
         backtest::structure_backtest::backtest_structure,
         flow::compute_order_flow,
         ha::{compute_ha_patterns, SEED_LOOKBACK},
@@ -237,6 +238,15 @@ struct OrderFlowBacktestInput {
     #[schemars(description = "Forward-return horizon in candles (default 10)")]
     #[serde(default = "default_backtest_lookahead")]
     lookahead_bars: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct OrderbookPressureBacktestInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\", \"BTCEUR\"")]
+    pair:   String,
+    #[schemars(description = "Number of daily 1d candles for forward-return context (default 200)")]
+    #[serde(default = "default_backtest_last_n")]
+    last_n: u32,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -764,6 +774,29 @@ impl FlowFunctionServer {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    // ── Orderbook Pressure Backtest (ADR-017, Story #51 / #40) ────────────────
+
+    #[tool(
+        name = "orderbook_pressure_backtest",
+        description = "Indicator-level daily calibration of Order Book Imbalance (OBI) against next-day return (ADR-017, Story #51). \
+                       Tests the claim: bid_vol_25 / ask_vol_25 reflects order book pressure at 25-level depth. \
+                       Aggregates OBI from the last 1-min snapshot per UTC calendar day, then measures next-day \
+                       OHLCV return per OBI ratio bucket. \
+                       5 buckets: strong_bid (>1.3), mild_bid (1.1–1.3), neutral (0.9–1.1), mild_ask (0.7–0.9), strong_ask (<=0.7). \
+                       Quality gate: pre-fix rows (bid_level_count=0 AND ts<2026-05-03 06:36) excluded. \
+                       Calibration gate: n>=30 per bucket (ADR-017). \
+                       Returns {pair, days_analyzed, total_observations, bucket_results, monotonic, rows_excluded_by_gate}. \
+                       QUERY — read-only."
+    )]
+    async fn orderbook_pressure_backtest(&self, Parameters(req): Parameters<OrderbookPressureBacktestInput>) -> Result<String, String> {
+        let pair    = parse_pair(&req.pair)?;
+        let tf      = parse_tf("1d")?;
+        let snaps   = self.adapter.orderbook_all(&pair).await.map_err(|e| e.to_string())?;
+        let candles = self.fetch_ohlcv(&pair, tf, req.last_n, 0).await?;
+        let result  = backtest_orderbook_pressure(&snaps, &candles, &req.pair);
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
     // ── Fibonacci Targets ──────────────────────────────────────────────────────
 
     #[tool(
@@ -1025,6 +1058,7 @@ impl ServerHandler for FlowFunctionServer {
                structure_backtest {pair,tf,last_n?,window_size?,lookahead_bars?,follow_threshold?,candle_source?} | \
                order_flow_backtest {pair,tf,last_n?,lookahead_bars?} | \
                order_blocks_backtest {pair,tf,last_n?,lookahead_bars?,candle_source?} | \
+               orderbook_pressure_backtest {pair,last_n?} | \
                fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
                harmonic_patterns {pair,tf,last_n?,profile?,candle_source?} | fib_time_zones {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\

@@ -8,8 +8,12 @@
 ///   - multi_anchor_fib_backtest: validates score-bucket calibration for
 ///     multi-anchor Fibonacci confluence (Stories #39 + #43).
 ///   - structure_backtest: validates BOS/CHoCH follow-through (Story #40).
+///   - order_flow_backtest: validates net_aggression forward-return bucketing (Story #40).
+///   - order_blocks_backtest: validates OB retest-respect rate (Story #40).
+///   - orderbook_pressure_backtest: validates OBI daily forward-return bucketing (Story #51 / #40).
 
 pub mod multi_anchor_fib_backtest;
 pub mod order_blocks_backtest;
 pub mod order_flow_backtest;
+pub mod orderbook_pressure_backtest;
 pub mod structure_backtest;
