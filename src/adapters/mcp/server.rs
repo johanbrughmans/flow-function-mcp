@@ -1,6 +1,6 @@
 /// FlowFunctionServer — MCP inbound adapter (Function Layer, TGF Layer 3).
 ///
-/// 21 QUERY tools (read-only):
+/// 22 QUERY tools (read-only):
 ///   OHLCV indicators : rsi, ma_cross, atr, bollinger, donchian, volatility
 ///   SMC              : fvg, order_blocks, structure, liquidity, fib_confluence, fib_targets, harmonic_patterns, fib_time_zones
 ///   Price action+flow: ha_pattern, order_flow
@@ -28,6 +28,7 @@ use crate::{
     adapters::mcp::candle_source::{apply_candle_source, CandleSource},
     adapters::composite::CompositeAdapter,
     domain::{
+        backtest::fib_targets_backtest::backtest_fib_targets,
         backtest::multi_anchor_fib_backtest::backtest_multi_anchor_fib,
         backtest::order_blocks_backtest::backtest_order_blocks,
         backtest::order_flow_backtest::backtest_order_flow,
@@ -211,6 +212,27 @@ struct FibConfluenceBacktestInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct FibTargetsBacktestInput {
+    #[schemars(description = "Trading pair e.g. \"ENJEUR\", \"BTCEUR\"")]
+    pair:           String,
+    #[schemars(description = "Timeframe: \"1h\", \"4h\", \"1d\", or \"1w\"")]
+    #[serde(default = "default_tf_1d")]
+    tf:             String,
+    #[schemars(description = "Total candle history to walk-forward over (default 1000)")]
+    #[serde(default = "default_backtest_last_n")]
+    last_n:         u32,
+    #[schemars(description = "Per-observation lookback window in candles (default 200, min 50)")]
+    #[serde(default = "default_backtest_window")]
+    window_size:    u32,
+    #[schemars(description = "Forward validation window in candles (default 10)")]
+    #[serde(default = "default_backtest_lookahead")]
+    lookahead_bars: u32,
+    #[schemars(description = "Maturity profile: \"nascent\" | \"developing\" | \"mature\" (default \"mature\")")]
+    #[serde(default)]
+    profile:        Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct OrderBlocksBacktestInput {
     #[schemars(description = "Trading pair e.g. \"ENJEUR\"")]
     pair:           String,
@@ -356,11 +378,12 @@ struct WalletFlowInput {
     last_n: Option<u32>,
 }
 
-fn default_last_n()              -> u32 { 60 }
-fn default_fib_last_n()          -> u32 { 200 }
-fn default_backtest_last_n()     -> u32 { 1000 }
-fn default_backtest_window()     -> u32 { 200 }
-fn default_backtest_lookahead()  -> u32 { 10 }
+fn default_last_n()              -> u32    { 60 }
+fn default_fib_last_n()          -> u32    { 200 }
+fn default_backtest_last_n()     -> u32    { 1000 }
+fn default_backtest_window()     -> u32    { 200 }
+fn default_backtest_lookahead()  -> u32    { 10 }
+fn default_tf_1d()               -> String { "1d".to_string() }
 
 // ── Parse helpers ──────────────────────────────────────────────────────────────
 
@@ -797,6 +820,34 @@ impl FlowFunctionServer {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    // ── Fibonacci Targets Backtest (ADR-017, Story #52 / #40) ─────────────────
+
+    #[tool(
+        name = "fib_targets_backtest",
+        description = "Indicator-level walk-forward calibration of Fibonacci Take-Profit Targets (ADR-017, Story #52). \
+                       Tests the claim: resistance clusters projected by fib_targets above an entry price represent \
+                       statistically meaningful price levels — higher-strength clusters (more anchors converging) \
+                       are hit more often within lookahead_bars. \
+                       Strength buckets: strength_1 (1 anchor), strength_2 (2), strength_3plus (≥3). \
+                       Hit = any future candle where high >= target.price within lookahead_bars. \
+                       Calibration gate: n≥30 targets per bucket (ADR-017). \
+                       Returns {pair, tf, bucket_results, monotonic, candles_analyzed, total_targets}. \
+                       Default tf=1d, last_n=1000, window_size=200, lookahead_bars=10, profile=mature. \
+                       QUERY — read-only."
+    )]
+    async fn fib_targets_backtest(&self, Parameters(req): Parameters<FibTargetsBacktestInput>) -> Result<String, String> {
+        let pair        = parse_pair(&req.pair)?;
+        let tf          = parse_tf(&req.tf)?;
+        let tf_str      = tf.label().to_string();
+        let window_size = (req.window_size.max(50)) as usize;
+        let lookahead   = req.lookahead_bars.max(1) as usize;
+        let profile     = parse_profile(req.profile)?;
+        let last_n      = req.last_n.max(window_size as u32 + req.lookahead_bars + 10);
+        let raw         = self.fetch_ohlcv(&pair, tf, last_n, 0).await?;
+        let result      = backtest_fib_targets(&raw, window_size, lookahead, &profile, &tf_str, &req.pair);
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
     // ── Fibonacci Targets ──────────────────────────────────────────────────────
 
     #[tool(
@@ -1059,6 +1110,7 @@ impl ServerHandler for FlowFunctionServer {
                order_flow_backtest {pair,tf,last_n?,lookahead_bars?} | \
                order_blocks_backtest {pair,tf,last_n?,lookahead_bars?,candle_source?} | \
                orderbook_pressure_backtest {pair,last_n?} | \
+               fib_targets_backtest {pair,tf?,last_n?,window_size?,lookahead_bars?,profile?} | \
                fib_targets {pair,tf,last_n?,entry_price,profile?,candle_source?} | \
                harmonic_patterns {pair,tf,last_n?,profile?,candle_source?} | fib_time_zones {pair,tf,last_n?,profile?,candle_source?}\n\
              Price Action + Flow (from PCTS SQL Server):\n\

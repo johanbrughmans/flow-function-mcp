@@ -11,7 +11,9 @@
 ///   - order_flow_backtest: validates net_aggression forward-return bucketing (Story #40).
 ///   - order_blocks_backtest: validates OB retest-respect rate (Story #40).
 ///   - orderbook_pressure_backtest: validates OBI daily forward-return bucketing (Story #51 / #40).
+///   - fib_targets_backtest: validates Fibonacci TP target hit rates by anchor strength (Story #52 / #40).
 
+pub mod fib_targets_backtest;
 pub mod multi_anchor_fib_backtest;
 pub mod order_blocks_backtest;
 pub mod order_flow_backtest;
